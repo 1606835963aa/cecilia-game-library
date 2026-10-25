@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="token" content="__TOKEN__">
+  <title>游戏库</title>
+  <link rel="icon" href="/web/icon.ico">
+  <link rel="stylesheet" href="/web/style.css">
+</head>
+<body>
+  <header class="topnav">
+    <a class="brand" href="#/">
+      <img src="/web/icon.ico" alt="">
+      <span>游戏库</span>
+    </a>
+    <nav class="nav-links">
+      <a href="#/" data-nav="home">主页</a>
+      <a href="#/settings" data-nav="settings">设置</a>
+    </nav>
+    <button id="now-playing" class="now-playing" hidden></button>
+    <div class="nav-right">
+      <span id="summary" class="summary"></span>
+      <button id="scan" class="nav-btn" title="立刻扫描 games 文件夹，并重新统计占用空间">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v5h-5"/></svg>
+        <span>扫描</span>
+      </button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="side-tools">
+        <label class="search">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+          <input id="search" type="search" placeholder="搜索（按 / 键）" autocomplete="off">
+        </label>
+        <select id="platform" aria-label="平台">
+          <option value="全部">全部平台</option>
+          <option value="PC">PC</option>
+          <option value="安卓">安卓</option>
+        </select>
+      </div>
+      <nav id="side-list" class="side-list" aria-label="游戏列表"></nav>
+    </aside>
+
+    <main id="view" class="view"></main>
+  </div>
+
+  <div id="ctx" class="ctx" role="menu" hidden></div>
+  <input type="file" id="image-file" accept="image/*" hidden>
+  <div id="toast" class="toast" role="status"></div>
+
+  <dialog id="confirm" class="dialog">
+    <form method="dialog">
+      <h2 id="confirm-title"></h2>
+      <p id="confirm-text"></p>
+      <div class="dialog-btns">
+        <button value="cancel" class="btn">取消</button>
+        <button value="ok" id="confirm-ok" class="btn btn-confirm"></button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="match" class="dialog dialog-wide">
+    <div class="match-head">
+      <h2>匹配资料</h2>
+      <p>在 Steam、VNDB、DLsite、itch.io 上搜这个游戏，选中正确的那个，封面、横幅、简介和截图会一起换上。知道它在哪儿卖的话，直接粘贴商店页面链接最准，DLsite 的游戏也可以只填作品编号（RJ、VJ 等字母开头的那串）。</p>
+      <form id="match-form" class="match-search">
+        <label class="search big">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+          <input id="match-q" type="text" placeholder="输入游戏名，或粘贴商店页面链接" autocomplete="off">
+        </label>
+        <button class="btn btn-primary">搜索</button>
+      </form>
+    </div>
+    <div id="match-results" class="match-results"></div>
+    <div class="dialog-btns match-foot">
+      <span class="hint">搜不到也没关系，可以在游戏页面右边「外观」里自己换封面和背景。</span>
+      <button class="btn" data-close>关闭</button>
+    </div>
+  </dialog>
+
+  <dialog id="viewer" class="viewer">
+    <img id="viewer-img" alt="">
+    <button class="viewer-nav prev" data-step="-1" aria-label="上一张"><svg viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></svg></button>
+    <button class="viewer-nav next" data-step="1" aria-label="下一张"><svg viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg></button>
+    <button class="viewer-close" data-close aria-label="关闭"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+    <div id="viewer-count" class="viewer-count"></div>
+  </dialog>
+
+  <script src="/web/app.js"></script>
+</body>
+</html>
