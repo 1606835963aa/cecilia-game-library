@@ -23,6 +23,11 @@ const ICONS = {
   right: '<svg viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg>',
   check: '<svg viewBox="0 0 24 24"><path d="M5 12.5 10 17l9-10"/></svg>',
   trash: '<svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></svg>',
+  plus: '<svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>',
+  archive: '<svg viewBox="0 0 24 24"><path d="M21 8v12a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V8"/><path d="M1 3h22v5H1zM10 12h4"/></svg>',
+  phone: '<svg viewBox="0 0 24 24"><rect x="6" y="2" width="12" height="20" rx="2"/><path d="M11 18h2"/></svg>',
+  clock: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
+  close: '<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>',
 };
 
 const ANDROID_HELP = {
@@ -132,7 +137,13 @@ const isCustom = name => (name || '').includes('-custom');
 const isRunning = g => g.running_seconds != null;
 const canPlay = g => g.platform === 'PC' && g.exe && !g.missing && !isRunning(g);
 const firstLetter = g => esc([...g.name.trim()][0] || '?').toUpperCase();
-const gradient = g => { const h = hue(g.name); return `linear-gradient(160deg,hsl(${h} 40% 34%),hsl(${(h + 50) % 360} 45% 16%))`; };
+// 没有任何图的游戏用名字算一个颜色；纸艺皮肤用浅一些的粉彩色
+const gradient = g => {
+  const h = hue(g.name);
+  return document.documentElement.dataset.theme === 'paper'
+    ? `linear-gradient(160deg,hsl(${h} 38% 86%),hsl(${(h + 40) % 360} 30% 72%))`
+    : `linear-gradient(160deg,hsl(${h} 40% 34%),hsl(${(h + 50) % 360} 45% 16%))`;
+};
 const game = id => state.games.find(g => g.id === id);
 const genres = g => (g.genres ? g.genres.split('、') : []);
 
@@ -589,6 +600,18 @@ function renderSettingsBody(s) {
   if (!body) return;
   body.innerHTML = `
     <section class="card">
+      <h3>皮肤</h3>
+      <div class="inner">
+        <div class="skins">${Object.entries(s.themes).map(([k, label]) => `
+          <label class="skin">
+            <input type="radio" name="theme" value="${k}" ${s.theme === k ? 'checked' : ''}>
+            <span class="skin-preview ${k}"><i class="p-nav"></i><i class="p-side"></i><i class="p-hero"></i><i class="p-tile"></i><i class="p-tile"></i><i class="p-tile"></i></span>
+            <span class="skin-name">${esc(label)}</span>
+          </label>`).join('')}
+        </div>
+      </div>
+    </section>
+    <section class="card">
       <h3>安卓版</h3>
       <div class="inner">
         <p class="hint">自动解压遇到安卓版（apk）时怎么处理，PC 版不受影响。</p>
@@ -610,7 +633,7 @@ function renderSettingsBody(s) {
     </section>
     <section class="card">
       <h3>游戏资料</h3>
-      <div class="inner">${toggleRow('auto_scrape', '新游戏自动联网找资料', '会把游戏名发给 Steam 和 VNDB 搜索。关掉后只从游戏文件里取，联网要在游戏页面手动点「匹配资料」。', s.auto_scrape)}</div>
+      <div class="inner">${toggleRow('auto_scrape', '新游戏自动联网找资料', '会把游戏名发给 Steam、VNDB、DLsite 和 itch.io 搜索。关掉后只从游戏文件里取，联网要在游戏页面手动点「匹配资料」。', s.auto_scrape)}</div>
     </section>
     <p class="hint">改完马上保存。正在运行的自动解压，下一轮扫描就会用上新设置。</p>`;
 }
@@ -840,7 +863,8 @@ function renderView() {
 function renderAll(full) {
   renderTopbar();
   renderSidebar();
-  if (state.route.page === 'settings') return;
+  // 设置页只在整页刷新时画一次，定时刷新游戏列表时不重画，免得冲掉正在改的选项
+  if (state.route.page === 'settings') return full && renderView();
   if (full || state.route.page === 'home') return renderView();
   // 游戏页面：资料变了且没在打字时整页重画，否则只更新时长、按钮这些会变的地方
   const g = game(state.route.id);
@@ -912,6 +936,251 @@ async function busyButton(btn, text, task) {
     btn.disabled = false;
     btn.innerHTML = html;
   }
+}
+
+// ---------------------------------------------------------------- 导入
+const IMPORT_POLL_MS = 1000;
+const IMPORT_ICONS = { folder: 'folder', archive: 'archive', apk: 'phone', unknown: 'warn' };
+const FOLDER_MODES = [
+  ['move', '挪进游戏库', '放进游戏库的文件夹，原来的位置就没有了'],
+  ['copy', '复制一份', '原来的留着不动，硬盘会多占一份空间'],
+  ['link', '留在原处', '文件不动，游戏库记住它在哪儿，以后挪走了会显示找不到'],
+];
+const imp = {
+  phase: 'closed',     // inspecting：正在识别 / review：勾选要导入的 / jobs：看进度
+  items: [],
+  checked: new Set(),
+  mode: localGet('importMode') || 'move',
+  deleteArchive: localGet('importDelete') === '1',
+  jobs: [],
+  finished: new Set(), // 已经处理过“做完了”的任务编号
+  timer: null,
+};
+const jobActive = j => j.state === 'waiting' || j.state === 'running';
+
+async function importPaths(paths) {
+  if (!paths || !paths.length) return;
+  closeImportMenu();
+  // 正在勾选时又拖进来一批，就加到列表里
+  if (!(imp.phase === 'review' && $('#import').open)) { imp.items = []; imp.checked.clear(); }
+  imp.phase = 'inspecting';
+  renderImport();
+  if (!$('#import').open) $('#import').showModal();
+  try {
+    const { items } = await api('POST', '/api/import/inspect', { paths });
+    for (const it of items) {
+      if (imp.items.some(x => x.key === it.key)) continue;
+      imp.items.push(it);
+      if (!it.blocked && !it.duplicate) imp.checked.add(it.key);
+    }
+  } catch (e) {
+    toast(e.message, true);
+  }
+  imp.phase = 'review';
+  renderImport();
+}
+window.importDropped = importPaths;  // 窗口那边拿到拖进来的文件路径后调这个
+
+function importItemHtml(it) {
+  const meta = [];
+  if (it.kind === 'archive') meta.push(it.parts > 1 ? `压缩包 · ${it.parts} 个分卷` : '压缩包');
+  if (it.kind === 'folder') meta.push(it.engine || '游戏文件夹');
+  if (it.kind === 'apk') meta.push('安卓');
+  if (it.version) meta.push(`v${it.version}`);
+  if (it.size) meta.push(fmtSize(it.size));
+  if (it.exe) meta.push(`主程序 ${it.exe}`);
+  const tag = it.blocked ? `<span class="i-tag no">${esc(it.blocked)}</span>`
+    : it.duplicate ? '<span class="i-tag warn">库里已有同名游戏</span>'
+    : it.in_library_dir ? '<span class="i-tag ok">已在游戏库文件夹里</span>' : '';
+  return `
+    <label class="i-row ${it.blocked ? 'blocked' : ''}">
+      <input type="checkbox" data-key="${esc(it.key)}" ${imp.checked.has(it.key) ? 'checked' : ''} ${it.blocked ? 'disabled' : ''}>
+      <span class="i-icon ${it.kind}">${ICONS[IMPORT_ICONS[it.kind]]}</span>
+      <div class="i-info">
+        <div class="i-name">${esc(it.name)}</div>
+        ${meta.length ? `<div class="i-meta">${meta.map(esc).join('<i class="dot"></i>')}</div>` : ''}
+        <div class="i-path" title="${esc(it.path)}">${esc(it.path)}</div>
+      </div>
+      ${tag}
+    </label>`;
+}
+
+function importJobHtml(j) {
+  const icon = { waiting: ICONS.clock, running: '<i class="spinner"></i>', done: ICONS.check, failed: ICONS.close }[j.state];
+  const pct = j.progress == null ? null : Math.round(j.progress * 100);
+  const msg = j.state === 'running' && pct != null ? `${j.message} ${pct}%` : j.message;
+  const bar = j.state === 'running' ? `<div class="i-bar ${pct == null ? 'busy' : ''}"><i style="${pct == null ? '' : `width:${pct}%`}"></i></div>` : '';
+  const retry = j.state === 'failed' && j.need_password ? `
+    <form class="i-retry" data-retry="${j.id}">
+      <input type="text" placeholder="解压密码" autocomplete="off" spellcheck="false" required>
+      <button class="btn btn-primary">重试</button>
+    </form>` : '';
+  const go = j.state === 'done' && j.game_id ? `<button class="btn" data-goto="${j.game_id}">查看</button>` : '';
+  return `
+    <div class="i-row job">
+      <span class="i-state ${j.state}">${icon}</span>
+      <span class="i-icon ${j.kind}">${ICONS[IMPORT_ICONS[j.kind]]}</span>
+      <div class="i-info">
+        <div class="i-name">${esc(j.name)}</div>
+        <div class="i-msg ${j.state === 'failed' ? 'failed' : ''}">${esc(msg)}</div>
+        ${bar}${retry}
+      </div>
+      ${go}
+    </div>`;
+}
+
+function renderImport() {
+  const list = $('#import-list');
+  const go = $('#import-go');
+  const cancel = $('#import-cancel');
+  if (imp.phase === 'inspecting') {
+    $('#import-sub').textContent = '正在识别……';
+    if (!imp.items.length) list.innerHTML = '<div class="i-empty"><i class="spinner"></i>正在识别</div>';
+    $('#import-opts').innerHTML = '';
+    $('#import-hint').textContent = '';
+    cancel.hidden = false;
+    go.disabled = true;
+    return;
+  }
+  if (imp.phase === 'review') {
+    const ok = imp.items.filter(it => !it.blocked).length;
+    $('#import-sub').textContent = imp.items.length
+      ? `认出 ${imp.items.length} 个，能导入 ${ok} 个` : '';
+    list.innerHTML = imp.items.length ? imp.items.map(importItemHtml).join('') : '<div class="i-empty">没认出能导入的东西</div>';
+    cancel.hidden = false;
+    renderImportOptions();
+    return;
+  }
+  const active = imp.jobs.filter(jobActive).length;
+  const failed = imp.jobs.filter(j => j.state === 'failed').length;
+  $('#import-sub').textContent = active ? '可以关掉这个窗口，导入会在后台继续'
+    : failed ? `导入完了，有 ${failed} 个没成功` : '全部导入完了';
+  // 输入框正在打字时不重画，免得把输进去的密码冲掉
+  if (!list.contains(document.activeElement) || document.activeElement.tagName !== 'INPUT') {
+    list.innerHTML = imp.jobs.map(importJobHtml).join('');
+  }
+  $('#import-opts').innerHTML = '';
+  $('#import-hint').textContent = `${imp.jobs.length - active} / ${imp.jobs.length} 完成`;
+  cancel.hidden = true;
+  go.disabled = false;
+  go.textContent = active ? '在后台继续' : '完成';
+}
+
+function renderImportOptions() {
+  const sel = imp.items.filter(it => imp.checked.has(it.key));
+  const needMode = sel.some(it => it.kind !== 'archive' && !it.in_library_dir);
+  const needDelete = sel.some(it => it.kind === 'archive');
+  $('#import-opts').innerHTML = (needMode ? `
+    <div>
+      <div class="opt-label">游戏文件夹放哪儿</div>
+      <div class="seg">${FOLDER_MODES.map(([v, title, help]) => `
+        <label><input type="radio" name="import-mode" value="${v}" ${imp.mode === v ? 'checked' : ''}><b>${title}</b><small>${help}</small></label>`).join('')}
+      </div>
+    </div>` : '') + (needDelete ? `
+    <label class="check"><input type="checkbox" id="import-delete" ${imp.deleteArchive ? 'checked' : ''}>解压成功后，把原压缩包移到回收站</label>` : '');
+  const size = sel.reduce((n, it) => n + (it.size || 0), 0);
+  $('#import-hint').textContent = sel.length ? `已选 ${sel.length} 个 · ${fmtSize(size)}` : '';
+  const go = $('#import-go');
+  go.disabled = !sel.length;
+  go.textContent = sel.length ? `导入 ${sel.length} 个` : '导入';
+}
+
+function renderImportButton() {
+  const btn = $('#import-btn');
+  const active = imp.jobs.filter(jobActive);
+  const failed = imp.jobs.filter(j => j.state === 'failed');
+  btn.classList.toggle('busy', !!active.length);
+  btn.classList.toggle('failed', !active.length && !!failed.length);
+  if (active.length) {
+    const total = imp.jobs.length;
+    const done = total - active.length;
+    const running = active.find(j => j.state === 'running');
+    const share = (done + (running && running.progress ? running.progress : 0)) / total;
+    btn.innerHTML = `<i class="spinner"></i><span>正在导入 ${Math.min(done + 1, total)}/${total}</span><i class="bar" style="width:${share * 100}%"></i>`;
+  } else if (failed.length) {
+    btn.innerHTML = `${ICONS.warn}<span>${failed.length} 个没导入成功</span>`;
+  } else {
+    btn.innerHTML = `${ICONS.plus}<span>导入游戏</span>`;
+  }
+}
+
+async function pollImports(quiet = false) {
+  clearTimeout(imp.timer);
+  let jobs;
+  try {
+    ({ jobs } = await api('GET', '/api/import/jobs'));
+  } catch {
+    imp.timer = setTimeout(pollImports, 3000);
+    return;
+  }
+  const newlyDone = jobs.filter(j => !jobActive(j) && !imp.finished.has(j.id));
+  newlyDone.forEach(j => imp.finished.add(j.id));
+  imp.jobs = jobs;
+  if (newlyDone.some(j => j.state === 'done')) load();
+  if (imp.phase === 'jobs' && $('#import').open) renderImport();
+  renderImportButton();
+  if (jobs.some(jobActive)) {
+    imp.timer = setTimeout(pollImports, IMPORT_POLL_MS);
+    return;
+  }
+  // 窗口关着时导入做完了，提示一下结果
+  if (quiet || !newlyDone.length || $('#import').open) return;
+  const failed = jobs.filter(j => j.state === 'failed').length;
+  if (failed) toast(`有 ${failed} 个没导入成功，点左下角看看原因`, true);
+  else toast(jobs.length === 1 ? `「${jobs[0].name}」${jobs[0].message}` : `${jobs.length} 个都导入好了`);
+}
+
+async function startImport() {
+  const items = imp.items.filter(it => imp.checked.has(it.key) && !it.blocked);
+  if (!items.length) return;
+  try {
+    await api('POST', '/api/import/start', { items, mode: imp.mode, delete_archive: imp.deleteArchive });
+  } catch (e) {
+    return toast(e.message, true);
+  }
+  imp.phase = 'jobs';
+  imp.items = [];
+  imp.checked.clear();
+  renderImport();
+  pollImports();
+}
+
+function showImportJobs() {
+  closeImportMenu();
+  imp.phase = 'jobs';
+  renderImport();
+  if (!$('#import').open) $('#import').showModal();
+}
+
+async function pickImport(what) {
+  closeImportMenu();
+  try {
+    const { paths } = await api('POST', '/api/import/pick', { what });
+    importPaths(paths);
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+function toggleImportMenu() {
+  const menu = $('#import-menu');
+  if (!menu.hidden) return closeImportMenu();
+  const old = menu.querySelector('[data-import-jobs]');
+  if (old) old.remove();
+  if (imp.jobs.length) {
+    const active = imp.jobs.filter(jobActive).length;
+    menu.insertAdjacentHTML('afterbegin', `
+      <button role="menuitem" data-import-jobs>${active ? '<i class="spinner"></i>' : ICONS.check}
+        <span>查看导入进度<small>${active ? `还有 ${active} 个在排队或进行中` : '上一批已经做完了'}</small></span>
+      </button>`);
+  }
+  menu.hidden = false;
+  $('#import-btn').setAttribute('aria-expanded', 'true');
+}
+
+function closeImportMenu() {
+  $('#import-menu').hidden = true;
+  $('#import-btn').setAttribute('aria-expanded', 'false');
 }
 
 // ---------------------------------------------------------------- 事件
@@ -1016,6 +1285,11 @@ view.addEventListener('change', async e => {
   if (t.id === 'sort') { state.sort = t.value; localSet('sort', t.value); return renderHome(); }
   if (t.id === 'status-filter') { state.statusFilter = t.value; return renderHome(); }
   if (t.name === 'android') return saveSettings({ android: t.value });
+  if (t.name === 'theme') {
+    document.documentElement.dataset.theme = t.value;
+    renderSidebar();
+    return saveSettings({ theme: t.value });
+  }
   if (t.dataset.setting) return saveSettings({ [t.dataset.setting]: t.checked });
   if (t.dataset.field) {
     const value = t.value.trim();
@@ -1057,14 +1331,103 @@ view.addEventListener('drop', e => {
   const hero = e.target.closest('#hero');
   if (!hero) return;
   e.preventDefault();
+  e.stopPropagation();  // 拖到背景大图上是换背景，不当成导入
+  endDrag();
   hero.classList.remove('drop');
   uploadImage(state.route.id, 'hero', e.dataTransfer.files[0]);
 });
 
-// 文件拖到背景大图以外的地方时，窗口默认会直接打开这个文件、把游戏库页面换掉
-for (const type of ['dragover', 'drop']) {
-  window.addEventListener(type, e => e.preventDefault());
+// 文件拖进窗口：盖一层“松手导入”的提示。拖到背景大图上时不盖，那里是换背景
+const dropOverlay = $('#drop-overlay');
+let dragDepth = 0;
+const draggingFiles = e => !!e.dataTransfer && [...e.dataTransfer.types].includes('Files');
+function endDrag() {
+  dragDepth = 0;
+  dropOverlay.hidden = true;
+  $('#import').classList.remove('dragging');
 }
+window.addEventListener('dragenter', e => {
+  if (!draggingFiles(e)) return;
+  dragDepth++;
+  dropOverlay.hidden = false;
+  $('#import').classList.add('dragging');
+});
+window.addEventListener('dragleave', e => {
+  if (draggingFiles(e) && --dragDepth <= 0) endDrag();
+});
+// 不拦下来的话，窗口默认会直接打开拖进来的文件、把游戏库页面换掉
+window.addEventListener('dragover', e => {
+  e.preventDefault();
+  dropOverlay.classList.toggle('off', !!(e.target.closest && e.target.closest('#hero')));
+});
+window.addEventListener('drop', e => {
+  e.preventDefault();
+  endDrag();
+  if (!window.pywebview && draggingFiles(e)) toast('在浏览器里打开时拖不进来，请在游戏库窗口里拖', true);
+});
+
+// 自绘标题栏的三个按钮；窗口那边最大化、还原后会调 setMaximized 换图标
+window.setMaximized = on => {
+  document.documentElement.classList.toggle('maximized', on);
+  $('[data-win="max"]').title = on ? '向下还原' : '最大化';
+};
+$('.win-ctrls').addEventListener('click', e => {
+  const btn = e.target.closest('[data-win]');
+  if (btn) api('POST', `/api/window/${btn.dataset.win}`).catch(err => toast(err.message, true));
+});
+
+$('#import-btn').addEventListener('click', toggleImportMenu);
+$('#import-menu').addEventListener('click', e => {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  if (btn.hasAttribute('data-import-jobs')) return showImportJobs();
+  pickImport(btn.dataset.importPick);
+});
+document.addEventListener('mousedown', e => { if (!e.target.closest('.side-foot')) closeImportMenu(); });
+
+const importDialog = $('#import');
+importDialog.addEventListener('change', e => {
+  const t = e.target;
+  if (t.dataset.key) {
+    t.checked ? imp.checked.add(t.dataset.key) : imp.checked.delete(t.dataset.key);
+    return renderImportOptions();
+  }
+  if (t.name === 'import-mode') { imp.mode = t.value; localSet('importMode', t.value); }
+  if (t.id === 'import-delete') { imp.deleteArchive = t.checked; localSet('importDelete', t.checked ? '1' : '0'); }
+});
+importDialog.addEventListener('click', e => {
+  if (e.target.closest('[data-close]')) return importDialog.close();
+  if (e.target.closest('#import-go')) return imp.phase === 'review' ? startImport() : importDialog.close();
+  const goto = e.target.closest('[data-goto]');
+  if (goto) {
+    importDialog.close();
+    location.hash = `#/game/${goto.dataset.goto}`;
+  }
+});
+importDialog.addEventListener('submit', async e => {
+  e.preventDefault();
+  const form = e.target.closest('[data-retry]');
+  if (!form) return;
+  const password = form.querySelector('input').value.trim();
+  form.querySelector('button').disabled = true;
+  try {
+    await api('POST', `/api/import/${form.dataset.retry}/retry`, { password });
+    form.querySelector('input').blur();
+    pollImports();
+  } catch (err) {
+    toast(err.message, true);
+    form.querySelector('button').disabled = false;
+  }
+});
+importDialog.addEventListener('close', () => {
+  // 全做完了才清掉记录；还在导入的话关掉窗口也照样在后台跑
+  if (imp.phase === 'jobs' && !imp.jobs.some(jobActive)) {
+    api('POST', '/api/import/clear').then(() => pollImports(true)).catch(() => {});
+  }
+  imp.phase = 'closed';
+  imp.items = [];
+  imp.checked.clear();
+});
 
 $('#match-form').addEventListener('submit', e => { e.preventDefault(); runSearch(); });
 $('#match').addEventListener('click', e => {
@@ -1120,6 +1483,7 @@ function ask(title, text, okText) {
 
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && state.ctx) return closeMenu();
+  if (e.key === 'Escape' && !$('#import-menu').hidden) return closeImportMenu();
   if (e.target.matches('input, textarea, select') || document.querySelector('dialog[open]')) return;
   if (e.key === '/') { e.preventDefault(); $('#search').focus(); }
   if (e.key === 'Escape' && state.route.page === 'game') location.hash = '#/';
@@ -1128,3 +1492,4 @@ document.addEventListener('keydown', e => {
 parseRoute();
 load(true);
 setInterval(load, POLL_MS);
+pollImports(true);

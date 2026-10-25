@@ -445,17 +445,8 @@ def scan(full=False):
                     conn.execute("UPDATE games SET path=?, missing=0 WHERE id=?", (rel, moved["id"]))
                     seen.add(moved["path"])
                     continue
-                if g["platform"] == "PC":
-                    ensure_normal_integrity(g["path"], g["exe"])
-                cur = conn.execute(
-                    "INSERT INTO games (path, name, version, platform, engine, exe, suspicious, ad_files, size_bytes, added_at)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    (rel, g["name"], g["version"], g["platform"], g["engine"], g["exe"], *extras,
-                     folder_size(g["path"]), now_str()),
-                )
-                refresh_icon(conn, cur.lastrowid, g["path"], g["exe"])
                 added.append(g["name"])
-                added_ids.append(cur.lastrowid)
+                added_ids.append(insert_game(conn, g))
                 continue
             updates = {"missing": 0, "suspicious": extras[0], "ad_files": extras[1]}
             if not row["exe_locked"] and row["exe"] != g["exe"]:
@@ -474,6 +465,67 @@ def scan(full=False):
                     conn.execute("UPDATE games SET missing=1 WHERE id=?", (row["id"],))
                 missing += 1
     return {"added": added, "added_ids": added_ids, "missing": missing, "total": len(found)}
+
+
+def insert_game(conn, g, exe_locked=False):
+    if g["platform"] == "PC":
+        ensure_normal_integrity(g["path"], g["exe"])
+    cur = conn.execute(
+        "INSERT INTO games (path, name, version, platform, engine, exe, exe_locked, suspicious, ad_files, size_bytes, added_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (to_rel(g["path"]), g["name"], g["version"], g["platform"], g["engine"], g["exe"], int(exe_locked),
+         json.dumps(g["suspicious"], ensure_ascii=False), g["ad_files"], folder_size(g["path"]), now_str()),
+    )
+    refresh_icon(conn, cur.lastrowid, g["path"], g["exe"])
+    return cur.lastrowid
+
+
+def describe(path, exe=""):
+    """认一个游戏文件夹（或 apk）。exe 给了就用它当主程序，文件夹认不出引擎也照样当游戏。"""
+    path = Path(path)
+    if path.is_file():
+        return apk_entry(path) if path.suffix.lower() == ".apk" else None
+    if not exe:
+        return detect_game(path)
+    files, dirs = _files_and_dirs(path)
+    name, version = parse_name(path.name)
+    return {"path": path, "name": name, "version": version, "platform": "PC",
+            "engine": detect_engine(path, files, dirs)[0], "exe": exe, **scan_extras(path, files, exe)}
+
+
+def add_game(path, exe=""):
+    """把一个游戏文件夹（或 apk）直接登记进游戏库，返回 (编号, 是不是新加的)。
+
+    不在 games 和安卓文件夹里的也能登记，扫描时不会把它当成不见了。
+    """
+    path = Path(path).resolve()
+    g = describe(path, exe)
+    if not g:
+        raise ValueError("没认出游戏：文件夹里找不到能运行的 exe")
+    with _db_lock, connect() as conn:
+        row = conn.execute("SELECT id FROM games WHERE path=?", (to_rel(path),)).fetchone()
+        if row:
+            conn.execute("UPDATE games SET missing=0 WHERE id=?", (row["id"],))
+            if exe:
+                conn.execute("UPDATE games SET exe=?, exe_locked=1 WHERE id=?", (exe, row["id"]))
+            return row["id"], False
+        return insert_game(conn, g, exe_locked=bool(exe)), True
+
+
+def find_by_path(path):
+    """这个文件夹（或 apk）已经在游戏库里的话，返回那条记录的编号。"""
+    with connect() as conn:
+        row = conn.execute("SELECT id FROM games WHERE path=?", (to_rel(path),)).fetchone()
+    return row["id"] if row else None
+
+
+def games_under(path):
+    """在这个文件夹里（或就是它）的游戏。"""
+    path = Path(path).resolve()
+    with connect() as conn:
+        rows = conn.execute("SELECT id, name, path FROM games").fetchall()
+    return [{"id": r["id"], "name": r["name"]} for r in rows
+            if (p := to_abs(r["path"]).resolve()) == path or path in p.parents]
 
 
 # ---------------------------------------------------------------- 查询与修改

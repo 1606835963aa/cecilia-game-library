@@ -35,7 +35,7 @@ if sys.stdout is None:
 def fatal(msg):
     """用 pythonw 运行时没有黑窗口，出错只能弹个对话框告诉用户。"""
     print(msg, file=sys.stderr)
-    ctypes.windll.user32.MessageBoxW(None, msg, "游戏库打不开", 0x10)
+    ctypes.windll.user32.MessageBoxW(None, msg, "塞西莉亚的游戏库打不开", 0x10)
     sys.exit(1)
 
 
@@ -43,14 +43,17 @@ try:
     import psutil
     import uvicorn
     import webview
+    from webview.dom import DOMEventHandler
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
     from fastapi.staticfiles import StaticFiles
 except ImportError as e:
     fatal(f"缺少 Python 模块：{e.name}\n\n在命令行运行下面这条命令装上：\npip install fastapi uvicorn psutil pywin32 Pillow pywebview")
 
+import importer
 import library
 import scraper
+from window_frame import CustomFrame
 from auto_extract import ANDROID_MODES, ROOT, android_root, load_config, save_config
 
 WEB_DIR = ROOT / "web"
@@ -61,8 +64,16 @@ PORT = 8765
 APP_ID = "game-library"
 TOKEN = secrets.token_hex(16)
 AUTO_SCAN_SECONDS = 60
-TITLE_BAR = "#171a21"  # 和页面顶部导航条同色
-TITLE_TEXT = "#dcdedf"
+# 皮肤：页面配色在 web 里，这里管窗口标题栏和页面出来之前的底色，都和页面顶部导航条同色
+THEMES = {
+    "steam": {"label": "经典深色", "dark": True, "bar": "#171a21", "text": "#dcdedf", "bg": "#1a1f26"},
+    "paper": {"label": "浪子的真情", "dark": False, "bar": "#f7f5ec", "text": "#26473b", "bg": "#f4f1e6"},
+}
+
+
+def current_theme():
+    theme = load_config().get("theme")
+    return theme if theme in THEMES else "steam"
 
 
 def log(msg):
@@ -156,6 +167,7 @@ class PlayTracker:
 
 tracker = PlayTracker()
 worker = scraper.Worker(log)
+imports = importer.Importer(log, worker.enqueue)
 
 
 # ---------------------------------------------------------------- 网页接口
@@ -177,7 +189,9 @@ async def guard(request: Request, call_next):
 @app.get("/", response_class=HTMLResponse)
 def index():
     html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
-    return html.replace("__TOKEN__", TOKEN)
+    html = html.replace("__TOKEN__", TOKEN).replace("__THEME__", current_theme())
+    # 软件窗口里标题栏是页面自己画的；用浏览器打开时没有这些按钮
+    return html.replace("__FRAME__", "custom" if shell.window else "")
 
 
 @app.get("/healthz")
@@ -191,6 +205,16 @@ def show(request: Request):
     if request.headers.get("x-app") != APP_ID:
         raise HTTPException(403)
     shell.bring_to_front()
+    return {"ok": True}
+
+
+@app.post("/api/window/{action}")
+def api_window(action: str):
+    if action not in ("min", "max", "close"):
+        raise HTTPException(404)
+    if not shell.frame:
+        raise HTTPException(400, "在浏览器里打开时用不了")
+    shell.frame.command(action)
     return {"ok": True}
 
 
@@ -375,6 +399,59 @@ def api_delete_files(game_id: int):
     return {"ok": True}
 
 
+# ---------------------------------------------------------------- 手动导入
+ARCHIVE_TYPES = ("压缩包 (*.zip;*.rar;*.7z;*.001;*.exe)", "所有文件 (*.*)")
+
+
+@app.post("/api/import/pick")
+async def api_import_pick(request: Request):
+    # 用系统自带的选择窗口挑压缩包或文件夹
+    if not shell.window:
+        raise HTTPException(400, "在浏览器里打开时用不了，请在游戏库窗口里导入")
+    folder = (await request.json()).get("what") == "folder"
+    if folder:
+        picked = shell.window.create_file_dialog(webview.FileDialog.FOLDER)
+    else:
+        picked = shell.window.create_file_dialog(webview.FileDialog.OPEN, allow_multiple=True, file_types=ARCHIVE_TYPES)
+    return {"paths": list(picked or [])}
+
+
+@app.post("/api/import/inspect")
+async def api_import_inspect(request: Request):
+    paths = [str(p) for p in (await request.json()).get("paths") or [] if p]
+    return {"items": await run_blocking(importer.inspect, paths)}
+
+
+@app.post("/api/import/start")
+async def api_import_start(request: Request):
+    body = await request.json()
+    try:
+        ids = imports.start(body.get("items") or [], body.get("mode", "move"), bool(body.get("delete_archive")))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ids": ids}
+
+
+@app.post("/api/import/{job_id}/retry")
+async def api_import_retry(job_id: int, request: Request):
+    try:
+        ids = imports.retry(job_id, (await request.json()).get("password", ""))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ids": ids}
+
+
+@app.get("/api/import/jobs")
+def api_import_jobs():
+    return {"jobs": imports.jobs()}
+
+
+@app.post("/api/import/clear")
+def api_import_clear():
+    imports.clear()
+    return {"ok": True}
+
+
 # ---------------------------------------------------------------- 设置
 @app.get("/api/settings")
 def api_settings():
@@ -385,6 +462,8 @@ def api_settings():
         "android_dir": str(android_root(cfg)),
         "auto_scrape": bool(cfg.get("auto_scrape", True)),
         "delete_archive": bool(cfg.get("delete_archive", True)),
+        "theme": current_theme(),
+        "themes": {k: v["label"] for k, v in THEMES.items()},
     }
 
 
@@ -396,10 +475,16 @@ async def api_save_settings(request: Request):
         if body["android"] not in ANDROID_MODES:
             raise HTTPException(400, "不认识的安卓版处理方式")
         updates["android"] = body["android"]
+    if "theme" in body:
+        if body["theme"] not in THEMES:
+            raise HTTPException(400, "不认识的皮肤")
+        updates["theme"] = body["theme"]
     try:
         save_config(updates)
     except (OSError, ValueError) as e:
         raise HTTPException(400, f"设置没存上：{e}")
+    if "theme" in updates:
+        shell.paint_title_bar()
     return api_settings()
 
 
@@ -454,13 +539,14 @@ def colorref(hex_color):
 class Shell:
     """游戏库的软件窗口。
 
-    关窗口时如果还有游戏在玩，只把窗口藏起来，后台继续计时，游戏结束后再真正退出；
+    关窗口时如果还有游戏在玩、或者还在导入，只把窗口藏起来，后台继续计时、导入，都结束后再真正退出；
     藏起来的这段时间再双击启动，会把窗口重新显示出来。
     """
 
     def __init__(self):
         self.window = None
         self.hwnd = None
+        self.frame = None
         self.hidden = False
         self.maximized = False
         self.state = {}
@@ -472,30 +558,77 @@ class Shell:
             self.state = {}
         self.maximized = bool(self.state.get("maximized"))
         self.window = webview.create_window(
-            "游戏库", url,
+            "塞西莉亚的游戏库", url,
             width=self.state.get("width", 1320), height=self.state.get("height", 880),
-            min_size=(960, 620), maximized=self.maximized, background_color="#1a1f26",
+            min_size=(960, 620), maximized=self.maximized, background_color=THEMES[current_theme()]["bg"],
         )
         events = self.window.events
         events.shown += self.on_shown
+        events.loaded += self.on_loaded
         events.closing += self.on_closing
-        events.maximized += lambda: setattr(self, "maximized", True)
-        events.restored += lambda: setattr(self, "maximized", False)
+        events.maximized += lambda: self.set_maximized(True)
+        events.restored += lambda: self.set_maximized(False)
         threading.Thread(target=self.exit_when_idle, daemon=True).start()
         # 关掉无痕模式，页面记住的东西（比如左边分组收起没有）下次打开还在
         webview.start(private_mode=False, storage_path=str(WEBVIEW_DATA), icon=str(ICON))
 
     def on_shown(self):
-        # 标题栏涂成和页面顶部一样的深色（Windows 11 才支持改颜色，Windows 10 会忽略）
         self.hwnd = self.window.native.Handle.ToInt32()
-        for attr, value in ((20, 1), (35, colorref(TITLE_BAR)), (36, colorref(TITLE_TEXT))):
+        self.paint_title_bar()
+        self.frame = CustomFrame(self.hwnd)
+        self.on_ui_thread(self.frame.install)
+
+    def on_ui_thread(self, fn):
+        from System import Action
+
+        self.window.native.Invoke(Action(fn))
+
+    def set_maximized(self, value):
+        self.maximized = value
+        self.window.evaluate_js(f"window.setMaximized && setMaximized({json.dumps(value)})")
+
+    def paint_title_bar(self):
+        # 系统标题栏藏起来了，这里管的是窗口边框、右键系统菜单的深浅色，跟着皮肤走
+        # （Windows 11 才支持改颜色，Windows 10 会忽略）
+        if not self.hwnd:
+            return
+        theme = THEMES[current_theme()]
+        for attr, value in ((20, int(theme["dark"])), (35, colorref(theme["bar"])), (36, colorref(theme["text"]))):
             ctypes.windll.dwmapi.DwmSetWindowAttribute(self.hwnd, attr, ctypes.byref(ctypes.c_int(value)), 4)
 
+    def on_loaded(self):
+        # 拖动窗口用的是 WebView2 的“页面标题栏”功能，要先打开；打开后刷新一次页面才生效
+        # WebView2 的对象只能在窗口线程里碰，在别的线程里读写会把两边卡死
+        switched = []
+
+        def enable():
+            settings = self.window.native.browser.webview.CoreWebView2.Settings
+            if not settings.IsNonClientRegionSupportEnabled:
+                settings.IsNonClientRegionSupportEnabled = True
+                switched.append(True)
+
+        self.on_ui_thread(enable)
+        if switched:
+            self.window.evaluate_js("location.reload()")
+            return
+        self.set_maximized(self.frame.maximized() if self.frame else self.maximized)
+        # 页面每次加载完都要重新挂一次；只有在 Python 这边才拿得到拖进来的文件的完整路径
+        self.window.dom.document.events.drop += DOMEventHandler(self.on_drop, prevent_default=True)
+
+    def on_drop(self, event):
+        files = (event.get("dataTransfer") or {}).get("files") or []
+        paths = [f["pywebviewFullPath"] for f in files if f.get("pywebviewFullPath")]
+        if paths:
+            self.window.evaluate_js(f"window.importDropped({json.dumps(paths)})")
+
     def on_closing(self):
-        if tracker.active():
+        if tracker.active() or imports.busy():
             self.hidden = True
             self.window.hide()
-            log("窗口藏起来了，游戏还在运行，玩完会自动记下时长再退出")
+            if tracker.active():
+                log("窗口藏起来了，游戏还在运行，玩完会自动记下时长再退出")
+            else:
+                log("窗口藏起来了，还在导入游戏，导入完再退出")
             return False
         self.save_state()
 
@@ -522,7 +655,7 @@ class Shell:
     def exit_when_idle(self):
         while True:
             time.sleep(PlayTracker.CHECK_SECONDS)
-            if self.hidden and not tracker.active():
+            if self.hidden and not tracker.active() and not imports.busy():
                 self.window.destroy()
                 return
 
@@ -564,6 +697,8 @@ def main():
     threading.Thread(target=tracker.loop, daemon=True).start()
     threading.Thread(target=auto_scan_loop, daemon=True).start()
     threading.Thread(target=worker.loop, daemon=True).start()
+    imports.cleanup()
+    threading.Thread(target=imports.loop, daemon=True).start()
     worker.enqueue(library.unprocessed_games())
     while not server.started:
         time.sleep(0.1)

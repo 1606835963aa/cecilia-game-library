@@ -37,7 +37,7 @@ ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.json"
 STATE_PATH = ROOT / "data" / "extract_state.json"
 LOG_DIR = ROOT / "logs"
-WORK_DIR = ROOT / "data"
+WORK_DIR = ROOT / "data"  # 解压时的中转文件夹都放在这里
 
 DEFAULT_CONFIG = {
     "watch_dirs": ["games"],
@@ -51,6 +51,7 @@ DEFAULT_CONFIG = {
     "auto_scrape": True,
     "android": "keep",
     "android_dir": "android",
+    "theme": "steam",
 }
 # 安卓版的处理方式
 ANDROID_MODES = {
@@ -68,7 +69,8 @@ SEVEN_ZIP_CANDIDATES = [
 ]
 
 TEMP_MARKERS = (".baiduyun.", ".downloading", ".tmp")
-SKIP_DIRS = {".git", "data", "logs", "tmp", "$RECYCLE.BIN", "System Volume Information"}
+IMPORTING_DIR = "_正在导入"  # 游戏库手动导入时在 games 里用的中转文件夹，扫描和监视都跳过它
+SKIP_DIRS = {".git", "data", "logs", "tmp", IMPORTING_DIR, "$RECYCLE.BIN", "System Volume Information"}
 
 ARCHIVE_MAGIC = (
     (b"PK\x03\x04", "zip"),
@@ -148,6 +150,7 @@ def run_7z(seven, args, timeout=None):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         timeout=timeout,
+        creationflags=subprocess.CREATE_NO_WINDOW,  # 游戏库没有黑窗口，不加的话每次调用 7-Zip 都会闪一个
     )
     raw = proc.stdout or b""
     for enc in ("utf-8", "gbk"):
@@ -336,6 +339,7 @@ def verify_password_stream(seven, archive, password, probe_file):
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
     except OSError:
         return False
@@ -566,8 +570,11 @@ def extract_zip_with_python(zip_path, pwd_bytes, staging):
                     shutil.copyfileobj(src, dst, 8 * 1024 * 1024)
 
 
-def collect_hints(directory, extra=None):
-    """从文件名、文件夹名和小文本里找密码线索（如“2级解压密码GAME158”）。"""
+def collect_hints(directory, extra=None, recursive=True):
+    """从文件名、文件夹名和小文本里找密码线索（如“2级解压密码GAME158”）。
+
+    recursive=False 时只看这一层，不往子文件夹里找（压缩包在桌面、下载这类大文件夹里时用）。
+    """
     hints = []
     seen = set()
 
@@ -611,6 +618,8 @@ def collect_hints(directory, extra=None):
                     continue
                 for m in PASSWORD_HINT.finditer(text):
                     add(m.group(1))
+            if not recursive:
+                break
     except OSError:
         pass
     return hints
@@ -920,25 +929,35 @@ def remove_empty_dirs(directory):
 
 
 # ---------------------------------------------------------------- 主流程
-def process_group(seven, group, cfg, passwords, watch_roots):
+def process_group(seven, group, cfg, passwords, watch_roots, into=None):
+    """解压一组压缩包并整理好，返回 (成功没有, 说明)。
+
+    into：解压进这个文件夹（游戏库手动导入用）。这时只装着安卓版的压缩包解到安卓文件夹，
+    原压缩包不动，删不删由导入那边决定。
+    """
     trigger = group["trigger"]
     parent = trigger.parent
     log(f"发现压缩包：{trigger.name}（{human_size(trigger.stat().st_size)}）")
-    hints = collect_hints(parent, passwords)
+    hints = collect_hints(parent, passwords, recursive=into is None)
     android_only = archive_is_android(seven, group, hints)
-    if android_only and divert_android_archive(group, cfg, watch_roots):
-        return True
+    if android_only and into is None and divert_android_archive(group, cfg, watch_roots):
+        return True, "安卓版"
     staging = WORK_DIR / "_staging"
     ok, note = extract_to_staging(seven, group, hints, staging)
     if not ok:
         shutil.rmtree(staging, ignore_errors=True)
         log(f"  跳过：{note} —— {trigger.name}")
-        return False
-    at_root = any(parent == r for r in watch_roots) or android_only
-    out_dir = output_dir(parent, android_only, watch_roots, cfg)
+        return False, note
+    if into is not None:
+        at_root = True
+        out_dir = android_root(cfg) if android_only else into
+        out_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        at_root = any(parent == r for r in watch_roots) or android_only
+        out_dir = output_dir(parent, android_only, watch_roots, cfg)
     dest = organize(staging, out_dir, group.get("name_override") or clean_name(trigger), at_root)
     log(f"  已解压到：{dest}" + ("（安卓版）" if android_only else ""))
-    if cfg.get("delete_archive", True):
+    if into is None and cfg.get("delete_archive", True):
         removed = delete_group_files(group)
         log(f"  已删除压缩包 {removed} 个")
         if android_only:
@@ -960,7 +979,7 @@ def process_group(seven, group, cfg, passwords, watch_roots):
     remove_empty_dirs(dest)
     if dest.is_dir():
         prune_empty_parents(dest, watch_roots)
-    return True
+    return True, note
 
 
 def scan_once(cfg, seven, state, seen, cooldown, force=False):
@@ -1005,7 +1024,7 @@ def scan_once(cfg, seven, state, seen, cooldown, force=False):
                     continue
                 found += 1
                 try:
-                    ok = process_group(seven, group, cfg, cfg.get("passwords") or [], watch_roots)
+                    ok, _ = process_group(seven, group, cfg, cfg.get("passwords") or [], watch_roots)
                 except Exception as e:  # noqa: BLE001 单个文件出错不影响其它
                     log(f"  处理异常：{path.name}：{e}")
                     ok = False
@@ -1076,7 +1095,7 @@ def main():
         if not group:
             log(f"不是可识别的压缩包（或不是分卷第一份）：{path}")
             sys.exit(1)
-        ok = process_group(seven, group, cfg, cfg.get("passwords") or [], [path.parent.resolve()])
+        ok, _ = process_group(seven, group, cfg, cfg.get("passwords") or [], [path.parent.resolve()])
         sys.exit(0 if ok else 1)
 
     if args.once:
