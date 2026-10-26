@@ -11,6 +11,7 @@
 import itertools
 import os
 import queue
+import re
 import shutil
 import threading
 from pathlib import Path
@@ -34,8 +35,7 @@ PROGRAM_DIRS = ("web", "data", "logs", ".git", "__pycache__")  # 游戏库程序
 
 
 def games_root():
-    cfg = load_config()
-    return resolve_dir((cfg.get("watch_dirs") or ["games"])[0])
+    return auto_extract.games_root(load_config())
 
 
 def inside(path, roots):
@@ -46,6 +46,14 @@ def inside(path, roots):
 def first_volume(path):
     """拖进来的是分卷里的第 2、3 份时，找到第 1 份所在的那组。"""
     name = canon(path.name)
+    sfx = re.fullmatch(r"(.+)\.\d+\.sfxv", name, re.I)
+    if sfx:
+        for sibling in path.parent.iterdir():
+            if canon(sibling.name).lower() == sfx.group(1).lower() + ".exe":
+                group = archive_group(sibling)
+                if group and path in group["parts"]:
+                    return group
+        return None
     for pattern in (PART_RAR, SEVEN_SPLIT, Z_SPLIT, R_SPLIT):
         m = pattern.match(name)
         if m:
@@ -66,7 +74,7 @@ def first_volume(path):
 
 def known_names():
     """游戏库里已有游戏的名字（按文件夹名拆出来的，不受后来改名影响）。"""
-    games = library.list_games()
+    games = [g for g in library.list_games() if not g["is_wishlist"]]
     return {library.folder_key(g) for g in games} | {g["name"].lower() for g in games}
 
 
@@ -342,8 +350,8 @@ class Importer:
             ok, note = process_group(seven, group, cfg, passwords, [staging], into=staging)
             if not ok:
                 need = "密码" in note
-                raise ImportFailed("密码不对，输入正确的密码再试一次" if need else note, need_password=need)
-            placed = [shutil.move(str(p), str(unique(root / p.name))) for p in list(staging.iterdir())]
+                raise ImportFailed(note, need_password=need)
+            placed = [str(auto_extract.publish_game(p, root)) for p in list(staging.iterdir())]
         finally:
             shutil.rmtree(staging, ignore_errors=True)
             prune(staging.parent)
@@ -361,7 +369,7 @@ class Importer:
         elif not placed:
             message = "解压好了，放进了安卓文件夹"
         else:
-            message = f"解压好了，但没认出游戏，文件在 games\\{Path(placed[0]).name}"
+            message = f"解压好了，但没认出游戏，文件在 {placed[0]}"
         if job["delete_archive"]:
             try:
                 for part in group["parts"]:

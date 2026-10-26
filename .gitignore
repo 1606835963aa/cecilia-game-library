@@ -31,4 +31,6 @@ config.json
 
 # 下载的游戏与运行数据
 games/
+downloads/
+android/
 data/

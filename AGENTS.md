@@ -8,7 +8,7 @@
 
 | 进程 | 入口 | 作用 |
 | --- | --- | --- |
-| 自动解压 | `auto_extract.py`（`启动自动解压.bat`） | 常驻监视 `games` 文件夹，等文件下完后解压、试密码、整理文件夹、删压缩包 |
+| 自动解压 | `auto_extract.py`（`启动自动解压.bat`） | 常驻监视 `downloads`，等文件下完后解压、逐层试密码，全部成功后放进 `games/Game_编号` 并按设置删原包 |
 | 游戏库 | `game_manager.py`（`打开游戏库.bat`，用 `pythonw` 启动） | FastAPI 本机小网站 + pywebview 窗口（WebView2），扫描入库、找资料、启动计时、手动导入 |
 
 两个常驻进程共用 `config.json`（设置）和文件系统。各自每轮重新读 `config.json`，所以在游戏库设置页改的东西，自动解压下一轮就会用上。游戏库点「刷新」时另外启动一次性解压子进程（`auto_extract.py --once --events`），通过标准输出读取进度，完成后扫描入库。刷新和独立监视通过 `data/extract.lock` 互斥，避免同时处理同一个压缩包。
@@ -27,6 +27,7 @@
 | `library.py` | SQLite 数据库（`data/library.db`，表 `games` 和 `sessions`）、引擎识别、主程序挑选、扫描入库、图标提取、低完整性标签修复、回收站删除 |
 | `scraper.py` | 找资料：游戏文件本地读取（Ren'Py rpa、Godot pck、RPG Maker、Unity）+ Steam / VNDB / DLsite / itch.io；`Worker` 是后台排队线程 |
 | `itch_account.py` | itch.io 官网登录窗口、登录和成人内容状态检测、同一浏览器会话中的搜索、退出清理；登录状态由 WebView2 保存在 `data/webview` |
+| `wishlist.py` | 无本地文件的愿望单、加入时版本和官网版本历史、与已下载游戏的关联 |
 | `importer.py` | 手动导入：识别拖进来的路径，挪 / 复制 / 原地登记 / 解压；`Importer` 是后台排队线程，复用 `auto_extract.process_group` |
 | `game_manager.py` | FastAPI 路由（`/api/*`）、`PlayTracker` 计时、`RefreshRunner` 刷新解压、`Shell` 窗口生命周期、单实例、皮肤的标题栏颜色 |
 | `window_frame.py` | 自绘标题栏：Win32 子类化去掉系统标题栏，保留系统边框 |
@@ -39,7 +40,7 @@
 
 模块依赖方向：`auto_extract` ← `library` ← `scraper` / `importer` ← `game_manager`。`auto_extract.py` 不能反过来 import 其他模块，它要能单独运行。
 
-运行时生成、不进版本库：`games/`、`android/`、`data/`（数据库、封面、解压状态、窗口状态、WebView2 数据、中转文件夹）、`logs/`（`extract.log`、`game_manager.log`）。
+运行时生成、不进版本库：`downloads/`、`games/`、`android/`、`data/`（数据库、封面、解压状态、窗口状态、WebView2 数据、中转文件夹）、`logs/`（`extract.log`、`game_manager.log`）。
 
 ## 运行和调试
 
@@ -75,8 +76,10 @@ python auto_extract.py --once
 - **itch.io 登录**：官网窗口不挂本机 `js_api`；登录信息不进设置接口、日志或 `config.json`。搜索通过官网窗口内同源请求执行，公开作品详情仍用普通 HTTP 请求。退出只清理 itch.io 的 Cookie，不清理游戏库页面数据；关主窗口时要销毁隐藏的官网窗口。
 - **拖放导入**：完整文件路径只有 Python 这边拿得到（`Shell.on_drop` 里的 `pywebviewFullPath`），再通过 `window.importDropped(...)` 交给页面。
 - **改设置**：`save_config(updates)` 只合并给出的键。密码列表的增删接口（`/api/passwords`、`/api/passwords/remove`）每次在当下的文件上加减一个，不整份覆盖，因为导入线程也会往里写密码。
+- **目录分工**：`download_dirs` 是待解压来源，`games_dir` 是 PC 成品目录，`watch_dirs` 是额外的游戏扫描目录。下载目录不能与 PC、安卓成品目录重叠。完整解压和套娃检查在中转目录完成，内层失败保留来源原包。`publish_game` 去掉单一包装层并原子放进 `Game_编号`，`.game-library.json` 保存原名供入库和资料匹配。
 - **两边同时解压**：导入用 `data/import` 当中转文件夹（`importer.py` 里改了 `auto_extract.WORK_DIR`），自动解压用 `data/`；导入时在 `games` 里用的中转文件夹叫 `_正在导入`，它在 `SKIP_DIRS` 里，游戏库扫描和自动解压都跳过；自动解压还会跳过所有以 `_` 开头的文件夹。
 - **数据库迁移**：新字段加进 `library.EXTRA_COLUMNS`，`init_db` 启动时会给老数据库自动补列。路径在库里存相对 `ROOT` 的形式（`to_rel` / `to_abs`）。
+- **愿望单**：`games.is_wishlist=1` 的记录不需要物理路径，扫描、未处理队列和文件操作必须跳过。`wish_version` 只在加入或用户手动填写时改，之后获取官网资料只更新最近版本和历史；官网没标注或联网失败保留旧记录。关联本地游戏保留愿望单编号、版本和备注，合并记录，不移动游戏文件。
 - **手动改过的不覆盖**：`exe_locked=1` 的主程序扫描不改；文件名带 `-custom` 的封面、背景是手动换的，找资料时不覆盖。
 - **皮肤**：新组件先在 `style.css` 用变量写，浪子的真情皮肤需要不同样子时在 `theme-paper.css` 的 `[data-theme="paper"]` 下覆盖。加皮肤还要在 `game_manager.THEMES` 里配标题栏和底色。
 - **资料来源**：DLsite 和 itch.io 用的不是公开接口，抓取失败先怀疑网站改版。只读游戏文件里的数据，不运行游戏里的任何东西（`scraper._BasicTypesOnly` 限制了 pickle 能还原的类型）。

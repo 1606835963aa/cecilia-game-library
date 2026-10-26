@@ -53,9 +53,11 @@ except ImportError as e:
 import importer
 import library
 import scraper
+import wishlist
 from itch_account import ItchAccount
 from window_frame import CustomFrame
-from auto_extract import ANDROID_MODES, EVENT_PREFIX, ROOT, android_root, find_seven_zip, load_config, save_config
+from auto_extract import (ANDROID_MODES, EVENT_PREFIX, ROOT, android_root, download_roots, find_seven_zip,
+                          games_root, load_config, save_config, scan_lock, validate_layout)
 
 WEB_DIR = ROOT / "web"
 ICON = WEB_DIR / "icon.ico"
@@ -177,6 +179,7 @@ class RefreshRunner:
     def __init__(self):
         self.lock = threading.Lock()
         self.state = {"id": 0, "running": False, "phase": "idle", "message": "", "results": []}
+        self.starting_games = set()
 
     def snapshot(self):
         with self.lock:
@@ -196,6 +199,7 @@ class RefreshRunner:
                 return self.snapshot_unlocked()
             if not find_seven_zip(load_config()):
                 raise ValueError("没找到 7-Zip，装上后才能解压")
+            self.starting_games = {(g["id"], g["path"]) for g in library.list_games() if not g["is_wishlist"]}
             self.state = {
                 "id": self.state["id"] + 1, "running": True, "phase": "checking",
                 "message": "正在检查下载文件夹", "file": "", "results": [],
@@ -237,6 +241,9 @@ class RefreshRunner:
                 raise ValueError("解压程序没能完成，请查看 logs 文件夹里的 extract.log")
             self.update(phase="scanning", message="正在更新游戏列表", file="", **report)
             result = scan_and_queue(full=True)
+            # 自动扫描也会在解压期间入库，按刷新前后的记录比较，才能把抢先入库的也算上。
+            current_games = [g for g in library.list_games() if not g["is_wishlist"] and not g["missing"]]
+            added = [g["name"] for g in current_games if (g["id"], g["path"]) not in self.starting_games]
             parts = []
             if report["succeeded"]:
                 parts.append(f"已处理 {report['succeeded']} 项")
@@ -244,9 +251,9 @@ class RefreshRunner:
                 parts.append(f"{report['failed']} 个没解开")
             if report["waiting"]:
                 parts.append(f"{report['waiting']} 个还在下载，下载完再刷新")
-            parts.append(f"新入库 {len(result['added'])} 个游戏" if result["added"] else f"没有新游戏（共 {result['total']} 个）")
+            parts.append(f"新入库 {len(added)} 个游戏" if added else f"没有新游戏（共 {len(current_games)} 个）")
             message = "，".join(parts)
-            self.update(running=False, phase="done", message=message, added=result["added"], total=result["total"])
+            self.update(running=False, phase="done", message=message, added=added, total=len(current_games))
             log(f"刷新完成：{message}")
         except Exception as e:
             log(f"刷新失败：{e}")
@@ -319,16 +326,18 @@ def cover(name: str):
     return FileResponse(path, headers={"Cache-Control": "no-cache"})
 
 
-def require_game(game_id):
+def require_game(game_id, local=False):
     game = library.get_game(game_id)
     if not game:
         raise HTTPException(404, "游戏不存在")
+    if local and game["is_wishlist"]:
+        raise HTTPException(400, "这款游戏还没下载，请先关联本地游戏")
     return game
 
 
 @app.get("/api/games")
 def api_games():
-    games = library.list_games(tracker.seconds())
+    games = wishlist.decorate(library.list_games(tracker.seconds()))
     busy = worker.busy()
     for g in games:
         g["scraping"] = g["id"] in busy
@@ -341,6 +350,7 @@ def scan_and_queue(full=False):
         log(f"新入库：{'、'.join(result['added'])}")
         worker.enqueue(result["added_ids"])
     if full:
+        worker.enqueue_versions()
         worker.enqueue_icons()
     return result
 
@@ -382,20 +392,74 @@ async def api_match(game_id: int, request: Request):
         raise HTTPException(400, str(e))
     except OSError:
         raise HTTPException(502, "连不上资料网站，稍后再试")
-    return {"ok": True, "name": fields.get("name")}
+    return {"ok": True, "name": fields.get("name"), "game_id": fields["game_id"]}
+
+
+@app.post("/api/wishlist")
+async def api_add_wishlist(request: Request):
+    body = await request.json()
+    baseline = str(body.get("version") or "").strip()
+    if len(baseline) > 80:
+        raise HTTPException(400, "版本号请控制在 80 个字以内")
+    try:
+        return await run_blocking(scraper.add_wishlist, body.get("source"), body.get("id"), baseline)
+    except (ValueError, LookupError) as e:
+        raise HTTPException(400, str(e))
+    except OSError:
+        raise HTTPException(502, "连不上资料网站，稍后再试")
+
+
+@app.post("/api/wishlist/{game_id}/check")
+async def api_check_wishlist(game_id: int):
+    require_game(game_id)
+    try:
+        message = await run_blocking(scraper.check_wishlist_version, game_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except OSError:
+        raise HTTPException(502, "连不上资料网站，已保留上次的版本记录")
+    return {"message": message}
+
+
+@app.post("/api/wishlist/{game_id}/attach")
+async def api_attach_wishlist(game_id: int, request: Request):
+    require_game(game_id)
+    try:
+        local_id = int((await request.json()).get("local_id"))
+        if local_id in tracker.seconds():
+            raise HTTPException(409, "游戏正在运行，退出后再关联")
+        return {"game_id": await run_blocking(wishlist.bind, game_id, local_id)}
+    except (ValueError, TypeError) as e:
+        raise HTTPException(400, str(e) or "请选择已下载的游戏")
+
+
+@app.patch("/api/wishlist/{game_id}/version")
+async def api_record_wishlist_version(game_id: int, request: Request):
+    game = require_game(game_id)
+    if not game["wishlisted_at"]:
+        raise HTTPException(400, "这款游戏没有愿望单版本记录")
+    version = str((await request.json()).get("version") or "").strip()
+    if not version or len(version) > 80:
+        raise HTTPException(400, "请填写 80 个字以内的版本号")
+    wishlist.record_version(game_id, version, "手动填写", "manual")
+    return {"ok": True}
 
 
 @app.post("/api/games/{game_id}/rescrape")
 async def api_rescrape(game_id: int):
-    require_game(game_id)
+    game = require_game(game_id)
     msg, reachable = await run_blocking(scraper.auto_scrape, game_id)
-    return {"message": msg if reachable else msg + "（有资料网站没连上）"}
+    actual_id = game_id if library.get_game(game_id) else library.find_by_path(library.to_abs(game["path"]))
+    return {"message": msg if reachable else msg + "（有资料网站没连上）", "game_id": actual_id}
 
 
 @app.post("/api/games/{game_id}/clear-meta")
 async def api_clear_meta(game_id: int):
     require_game(game_id)
-    await run_blocking(scraper.clear, game_id)
+    try:
+        await run_blocking(scraper.clear, game_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     return {"ok": True}
 
 
@@ -418,7 +482,7 @@ async def api_update(game_id: int, request: Request):
 
 @app.post("/api/games/{game_id}/launch")
 def api_launch(game_id: int):
-    game = require_game(game_id)
+    game = require_game(game_id, local=True)
     if game["missing"]:
         raise HTTPException(400, "游戏文件夹已经不在了")
     tracker.launch(game)
@@ -427,7 +491,7 @@ def api_launch(game_id: int):
 
 @app.post("/api/games/{game_id}/open-folder")
 def api_open_folder(game_id: int):
-    path = library.to_abs(require_game(game_id)["path"])
+    path = library.to_abs(require_game(game_id, local=True)["path"])
     if not path.exists():
         raise HTTPException(400, "游戏文件夹已经不在了")
     if path.is_file():
@@ -439,7 +503,7 @@ def api_open_folder(game_id: int):
 
 @app.get("/api/games/{game_id}/exes")
 def api_exes(game_id: int):
-    game = require_game(game_id)
+    game = require_game(game_id, local=True)
     folder = library.to_abs(game["path"])
     return {"exes": library.list_exes(folder) if folder.is_dir() else [], "current": game["exe"]}
 
@@ -452,7 +516,7 @@ def api_sessions(game_id: int):
 
 @app.post("/api/games/{game_id}/exe")
 async def api_set_exe(game_id: int, request: Request):
-    require_game(game_id)
+    require_game(game_id, local=True)
     try:
         library.set_exe(game_id, (await request.json()).get("exe", ""))
     except ValueError as e:
@@ -496,7 +560,7 @@ def api_remove(game_id: int):
 
 @app.delete("/api/games/{game_id}/files")
 def api_delete_files(game_id: int):
-    game = require_game(game_id)
+    game = require_game(game_id, local=True)
     if game_id in tracker.seconds():
         raise HTTPException(409, "游戏正在运行，先退出游戏再删")
     try:
@@ -570,6 +634,9 @@ def api_settings():
         "android_dir": str(android_root(cfg)),
         "auto_scrape": bool(cfg.get("auto_scrape", True)),
         "delete_archive": bool(cfg.get("delete_archive", True)),
+        "download_dirs": [str(p) for p in download_roots(cfg)],
+        "games_dir": str(games_root(cfg)),
+        "native_window": shell.window is not None,
         "theme": current_theme(),
         "themes": {k: v["label"] for k, v in THEMES.items()},
         "passwords": [str(p) for p in cfg.get("passwords") or []],
@@ -589,13 +656,72 @@ async def api_save_settings(request: Request):
         if body["theme"] not in THEMES:
             raise HTTPException(400, "不认识的皮肤")
         updates["theme"] = body["theme"]
+    directories = {}
+    if "download_dirs" in body:
+        values = body["download_dirs"]
+        if not isinstance(values, list) or not values or any(not isinstance(v, str) or not v.strip() for v in values):
+            raise HTTPException(400, "请选择下载文件夹")
+        directories["download_dirs"] = values
+    if "games_dir" in body:
+        if not isinstance(body["games_dir"], str) or not body["games_dir"].strip():
+            raise HTTPException(400, "请选择游戏文件夹")
+        directories["games_dir"] = body["games_dir"]
     try:
-        save_config(updates)
+        if directories:
+            save_directories(dict(updates, **directories))
+        else:
+            save_config(updates)
     except (OSError, ValueError) as e:
         raise HTTPException(400, f"设置没存上：{e}")
     if "theme" in updates:
         shell.paint_title_bar()
     return api_settings()
+
+
+def save_directories(updates):
+    if refresh.busy() or imports.busy():
+        raise HTTPException(409, "正在解压或导入，完成后再改文件夹")
+    with scan_lock() as acquired:
+        if not acquired:
+            raise HTTPException(409, "自动解压正在运行，完成后再改文件夹")
+        cfg = dict(load_config(), **updates)
+        validate_layout(cfg)
+        for folder in [games_root(cfg), *download_roots(cfg)]:
+            folder.mkdir(parents=True, exist_ok=True)
+        save_config(dict(updates, games_dir=str(games_root(cfg)), download_dirs=[str(p) for p in download_roots(cfg)]))
+
+
+@app.post("/api/directories/pick")
+async def api_pick_directory(request: Request):
+    if not shell.window:
+        raise HTTPException(400, "请在游戏库软件窗口里更改文件夹")
+    kind = (await request.json()).get("kind")
+    if kind not in ("downloads", "games"):
+        raise HTTPException(400, "不认识的文件夹")
+    cfg = load_config()
+    current = download_roots(cfg)[0] if kind == "downloads" else games_root(cfg)
+    picked = await run_blocking(lambda: shell.window.create_file_dialog(webview.FileDialog.FOLDER, directory=str(current)))
+    if not picked:
+        return {"cancelled": True}
+    try:
+        save_directories({"download_dirs": [picked[0]]} if kind == "downloads" else {"games_dir": picked[0]})
+    except (OSError, ValueError) as e:
+        raise HTTPException(400, f"文件夹没改成：{e}")
+    return api_settings()
+
+
+@app.post("/api/directories/{kind}/open")
+def api_open_directory(kind: str):
+    cfg = load_config()
+    if kind == "downloads":
+        folder = download_roots(cfg)[0]
+    elif kind == "games":
+        folder = games_root(cfg)
+    else:
+        raise HTTPException(400, "不认识的文件夹")
+    folder.mkdir(parents=True, exist_ok=True)
+    os.startfile(folder)
+    return {"ok": True}
 
 
 @app.get("/api/itch/account")
@@ -878,6 +1004,12 @@ def main():
             log(f"没能叫出已经开着的窗口：{e}")
         return
 
+    cfg = load_config()
+    for folder in [games_root(cfg), *download_roots(cfg)]:
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            log(f"暂时无法创建文件夹 {folder}：{e}")
     library.init_db()
     if not args.browser:
         scraper.itch_browser = shell.itch

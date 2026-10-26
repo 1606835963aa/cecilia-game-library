@@ -452,6 +452,29 @@ select:focus-visible { box-shadow: 0 0 0 1px var(--blue-soft); outline: 0; }
 .page-title { margin: 0 0 20px; font-size: 24px; font-weight: 800; color: #fff; }
 .settings { display: grid; gap: 20px; }
 .settings .label { color: var(--text); font-weight: 600; }
+.directory-list { display: grid; gap: 24px; margin-bottom: 24px; }
+.directory-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; }
+.directory-path { display: block; color: var(--text-2); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; user-select: all; }
+.directory-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.wish-actions { flex-wrap: wrap; gap: 12px; }
+.wish-label { color: var(--text-2); font-weight: 600; }
+.wish-help { color: var(--text-2); line-height: 1.6; margin: 12px 0; }
+.wish-baseline { margin-top: 16px; }
+#wish-baseline[hidden] { display: none; }
+.version-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; }
+.version-card .inner { display: block; }
+.version-card .field label { color: var(--text-2); }
+.version-result { color: var(--blue-soft); font-size: 12px; font-weight: 600; margin-left: 12px; }
+.version-history { margin-top: 24px; color: var(--text-2); }
+.version-history summary { cursor: pointer; }
+.version-history ul { list-style: none; padding: 0; margin: 12px 0 0; }
+.version-history li { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; margin-top: 8px; }
+.version-history span { overflow-wrap: anywhere; }
+.extract-settings .hint, .settings .password-hint { color: var(--text-2); }
+@media (max-width: 600px) {
+  .directory-row { grid-template-columns: minmax(0, 1fr); }
+  .version-pair { grid-template-columns: minmax(0, 1fr); gap: 16px; }
+}
 .itch-status { display: flex; align-items: center; gap: 8px; color: var(--text); font-weight: 600; }
 .itch-status .spinner { margin: 0; }
 .itch-dot { width: 8px; height: 8px; flex: none; border-radius: 50%; background: var(--text-3); }

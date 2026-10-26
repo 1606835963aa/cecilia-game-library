@@ -135,7 +135,7 @@ function hue(text) {
 
 const isCustom = name => (name || '').includes('-custom');
 const isRunning = g => g.running_seconds != null;
-const canPlay = g => g.platform === 'PC' && g.exe && !g.missing && !isRunning(g);
+const canPlay = g => !g.is_wishlist && g.platform === 'PC' && g.exe && !g.missing && !isRunning(g);
 const firstLetter = g => esc([...g.name.trim()][0] || '?').toUpperCase();
 // 没有任何图的游戏用名字算一个颜色；纸艺皮肤用浅一些的粉彩色
 const gradient = g => {
@@ -206,8 +206,8 @@ function renderSidebar() {
   const list = state.games.filter(matches).sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'));
   const activeId = state.route.page === 'game' ? state.route.id : null;
   let html = `<a class="side-home ${state.route.page === 'home' ? 'active' : ''}" href="#/">${ICONS.home}<span>全部游戏</span></a>`;
-  for (const status of GROUP_ORDER) {
-    const items = list.filter(g => g.status === status);
+  for (const status of ['愿望单', ...GROUP_ORDER]) {
+    const items = list.filter(g => status === '愿望单' ? g.is_wishlist : !g.is_wishlist && g.status === status);
     if (!items.length) continue;
     const collapsed = state.collapsed.has(status);
     html += `<button class="group-head ${collapsed ? 'collapsed' : ''}" data-group="${status}">${ICONS.chevron}${status}<span class="n">${items.length}</span></button>`;
@@ -257,7 +257,7 @@ function artHtml(g) {
 }
 
 function tileHtml(g) {
-  const meta = isRunning(g) ? `运行中 · ${fmtRunning(g.running_seconds)}`
+  const meta = g.is_wishlist ? `愿望单${g.latest_version ? ' · v' + esc(g.latest_version) : ''}${g.version_comparison === 'newer' ? ' · 有新版' : ''}` : isRunning(g) ? `运行中 · ${fmtRunning(g.running_seconds)}`
     : g.play_seconds ? fmtDuration(g.play_seconds) : g.version ? `v${esc(g.version)}` : fmtSize(g.size_bytes);
   return `
     <a data-gid="${g.id}" class="tile ${g.missing ? 'missing' : ''} ${isRunning(g) ? 'running' : ''}" href="#/game/${g.id}" title="${esc(g.name)}">
@@ -286,7 +286,7 @@ function spotlightHtml(g) {
         ${g.logo ? img(g, g.logo, 'sp-logo', `title="${esc(g.name)}"`) : `<h2 class="sp-title">${esc(g.name)}</h2>`}
         <div class="sp-meta">${meta}</div>
         <div class="sp-actions">
-          ${g.platform === 'PC' ? `<button class="btn-play" data-play="${g.id}" ${canPlay(g) ? '' : 'disabled'}>${ICONS.play}<span>${isRunning(g) ? '运行中' : '开始游戏'}</span></button>` : ''}
+          ${g.platform === 'PC' && !g.is_wishlist ? `<button class="btn-play" data-play="${g.id}" ${canPlay(g) ? '' : 'disabled'}>${ICONS.play}<span>${isRunning(g) ? '运行中' : '开始游戏'}</span></button>` : ''}
           <a class="btn glass" href="#/game/${g.id}">查看详情</a>
         </div>
       </div>
@@ -295,16 +295,17 @@ function spotlightHtml(g) {
 
 function renderHome() {
   const view = $('#view');
-  if (!state.games.length) {
+  const wishPage = state.route.page === 'wishlist';
+  if (!state.games.length && !wishPage) {
     view.innerHTML = `<div class="home"><div class="empty-state"><h2>游戏库还是空的</h2>
-      <p>把游戏放进 games 文件夹（压缩包会被自动解压工具解开），再点右上角的「扫描」。</p></div></div>`;
+      <p>把压缩包放进下载文件夹，再点右上角「刷新」；也可以先去愿望单记录想玩的游戏。</p><a class="btn" href="#/wishlist">记录想玩的游戏</a></div></div>`;
     return;
   }
-  const base = state.games.filter(matches);
-  const byRecent = base.filter(g => !g.missing).sort(SORTS.recent);
+  const base = state.games.filter(matches).filter(g => !wishPage || g.is_wishlist);
+  const byRecent = base.filter(g => !g.missing && !g.is_wishlist).sort(SORTS.recent);
   const spot = byRecent.find(isRunning) || byRecent[0];
   const recent = base.filter(g => g.last_played && g !== spot).sort(SORTS.recent).slice(0, 10);
-  const wall = base.filter(g => state.statusFilter === '全部' || g.status === state.statusFilter)
+  const wall = base.filter(g => wishPage || state.statusFilter === '全部' || (state.statusFilter === '愿望单' ? g.is_wishlist : !g.is_wishlist && g.status === state.statusFilter))
     .sort((a, b) => (a.missing - b.missing) || SORTS[state.sort](a, b));
   const scroll = view.scrollTop;
   view.innerHTML = `
@@ -314,18 +315,18 @@ function renderHome() {
       <div class="shelf-head"><h2>最近游戏</h2></div>
       <div class="recent">${recent.map(g => `<div class="slot"><div class="when">${fmtAgo(g.last_played)}</div>${tileHtml(g)}</div>`).join('')}</div>` : ''}
       <div class="shelf-head">
-        <h2>${state.q ? `搜索「${esc(state.q)}」` : '全部游戏'}</h2><span class="n">${wall.length}</span>
+        <h2>${state.q ? `搜索「${esc(state.q)}」` : wishPage ? '愿望单' : '全部游戏'}</h2><span class="n">${wall.length}</span>
         <div class="tools">
-          <select id="status-filter" aria-label="状态">
-            ${['全部', ...state.statuses].map(s => `<option value="${s}" ${s === state.statusFilter ? 'selected' : ''}>${s === '全部' ? '全部状态' : s}</option>`).join('')}
-          </select>
+          ${wishPage ? '<button class="btn btn-primary" data-add-wish>添加游戏</button>' : `<select id="status-filter" aria-label="状态">
+            ${['全部', '愿望单', ...state.statuses].map(s => `<option value="${s}" ${s === state.statusFilter ? 'selected' : ''}>${s === '全部' ? '全部状态' : s}</option>`).join('')}
+          </select>`}
           <select id="sort" aria-label="排序">
             ${[['recent', '按最近玩过'], ['added', '按加入时间'], ['name', '按名字'], ['playtime', '按游戏时间'], ['size', '按占用空间']]
               .map(([v, t]) => `<option value="${v}" ${v === state.sort ? 'selected' : ''}>${t}</option>`).join('')}
           </select>
         </div>
       </div>
-      ${wall.length ? `<div class="wall">${wall.map(tileHtml).join('')}</div>` : '<div class="empty-state"><p>没有符合条件的游戏</p></div>'}
+      ${wall.length ? `<div class="wall">${wall.map(tileHtml).join('')}</div>` : `<div class="empty-state"><p>${wishPage ? '先搜名字、保存资料，想玩的时候再下载。' : '没有符合条件的游戏'}</p></div>`}
     </div>`;
   view.scrollTop = scroll;
 }
@@ -349,6 +350,12 @@ function heroHtml(g) {
 }
 
 function actionBarHtml(g) {
+  if (g.is_wishlist) return `<div class="action-bar wish-actions">
+    <span class="wish-label">愿望单 · 尚未下载</span>
+    <button class="btn btn-primary" data-wish-check>检查版本</button>
+    <button class="btn" data-wish-attach>关联已下载游戏</button>
+    <div class="spacer"></div><a class="btn" href="${esc(SOURCES[g.meta_source].link(g.meta_id))}" target="_blank" rel="noopener noreferrer">${ICONS.external}打开官网</a>
+  </div>`;
   return `
     <div class="action-bar">
       ${g.platform === 'PC'
@@ -404,7 +411,7 @@ function metaCardHtml(g) {
           <button class="btn" data-match>${ICONS.search}匹配资料</button>
           <button class="btn" data-rescrape ${g.scraping ? 'disabled' : ''}>${ICONS.refresh}自动获取</button>
         </div>
-        ${src ? '<button class="link subtle" data-clear-meta>清除网上的资料</button>' : ''}
+        ${src && !g.is_wishlist ? '<button class="link subtle" data-clear-meta>清除网上的资料</button>' : ''}
       </div>
     </section>`;
 }
@@ -423,6 +430,26 @@ function pictureHtml(g, kind, label) {
     </div>`;
 }
 
+// 两个版本并排优先，检查为主要操作，历史为次要；沿用文字色和 12、24px 间距。
+function versionCard(g) {
+  if (!g.wishlisted_at) return '';
+  const labels = {newer: '发现新版', same: '与加入时相同', older: '官网版本号较小', changed: '版本有变化', unknown: '待确认版本'};
+  const note = g.version_status === 'unknown' ? '这次官网没有明确标注版本，保留上次记录。' : g.version_status === 'error' ? '这次没有检查成功，保留上次记录。' : g.version_status === 'manual' ? '最近版本由你手动填写。' : g.version_evidence;
+  return `<section class="card version-card">
+    <h3>版本对比 <span class="version-result">${labels[g.version_comparison]}</span></h3>
+    <div class="inner">
+      <div class="version-pair">
+        <div class="field"><label for="wish-start">加入时版本</label><input id="wish-start" type="text" data-field="wish_version" value="${esc(g.wish_version)}" maxlength="80" placeholder="未提供，可手动补填"></div>
+        <div class="field"><label for="wish-current">最近记录版本</label><input id="wish-current" type="text" data-wish-version value="${esc(g.latest_version)}" maxlength="80" placeholder="未提供，可手动补填"></div>
+      </div>
+      <p class="wish-help">${esc(note || '官网未提供版本号。')}</p>
+      <p class="wish-help">${g.wishlisted_at.slice(0,10)} 加入${g.version_checked_at ? ' · 最近检查 ' + esc(g.version_checked_at) : ''}</p>
+      ${!g.is_wishlist ? `<button class="btn" data-wish-check ${g.scraping ? 'disabled' : ''}>${ICONS.refresh}检查版本</button>` : ''}
+      ${g.version_history.length ? `<details class="version-history"><summary>版本记录（${g.version_history.length}）</summary><ul>${[...g.version_history].reverse().map(item => `<li><b>${esc(item.version)}</b><span>${esc(item.checked_at)} · ${esc(item.evidence || '官网')}</span></li>`).join('')}</ul></details>` : ''}
+    </div>
+  </section>`;
+}
+
 function renderGame(id) {
   const g = game(id);
   const view = $('#view');
@@ -430,13 +457,14 @@ function renderGame(id) {
     view.innerHTML = '<div class="home"><div class="empty-state"><h2>找不到这个游戏</h2><p><a href="#/" class="link">回到主页</a></p></div></div>';
     return;
   }
-  const isPC = g.platform === 'PC';
+  const isPC = g.platform === 'PC' && !g.is_wishlist;
   state.artKey = artKey(g);
   view.innerHTML = `
     ${heroHtml(g)}
     ${actionBarHtml(g)}
     <div class="detail-body">
       <div class="col">
+        ${versionCard(g)}
         ${g.suspicious.length || g.ad_files ? `
         <section class="card alert">
           <h3>${ICONS.warn}注意来路不明的文件</h3>
@@ -464,7 +492,7 @@ function renderGame(id) {
           <h3>游戏信息</h3>
           <div class="inner">
             <div class="field"><label>名字</label><input type="text" data-field="name" value="${esc(g.name)}"></div>
-            <div class="field"><label>版本</label><input type="text" data-field="version" value="${esc(g.version)}" placeholder="比如 0.5.27"></div>
+            ${!g.is_wishlist ? `<div class="field"><label>${g.wishlisted_at ? '本地版本' : '版本'}</label><input type="text" data-field="version" value="${esc(g.version)}" placeholder="比如 0.5.27"></div>` : ''}
             <div class="field"><span class="k">状态</span>
               <div class="segmented">${state.statuses.map(s => `<button data-status="${s}" class="${s === g.status ? 'active' : ''}">${s}</button>`).join('')}</div>
             </div>
@@ -484,7 +512,7 @@ function renderGame(id) {
           <p class="hint pad">图片也可以直接拖到页面顶部的大图上，换成背景。</p>
         </section>
 
-        <section class="card">
+        ${!g.is_wishlist ? `<section class="card">
           <h3>文件</h3>
           <div class="inner">
             ${isPC ? `
@@ -499,13 +527,13 @@ function renderGame(id) {
               <dt>加入</dt><dd>${esc(g.added_at.slice(0, 10))}</dd>
             </dl>
           </div>
-        </section>
+        </section>` : ''}
 
         <div class="danger-zone">
           <div><button class="link" data-remove>从游戏库移除</button>
             <div class="hint">只删游戏库里的记录和游玩时长，不动硬盘上的文件。</div></div>
-          <div><button class="link danger" data-delete-files>${ICONS.trash}删除游戏</button>
-            <div class="hint">把${g.platform === 'PC' ? '游戏文件夹' : ' apk 文件'}（${fmtSize(g.size_bytes)}）移到回收站，游戏库里的记录也一起删掉。</div></div>
+          ${!g.is_wishlist ? `<div><button class="link danger" data-delete-files>${ICONS.trash}删除游戏</button>
+            <div class="hint">把${g.platform === 'PC' ? '游戏文件夹' : ' apk 文件'}（${fmtSize(g.size_bytes)}）移到回收站，游戏库里的记录也一起删掉。</div></div>` : ''}
         </div>
       </div>
     </div>`;
@@ -525,11 +553,12 @@ function renderGame(id) {
 }
 
 // 资料或图片变了（比如后台刚找到资料）才需要整页重画
-const artKey = g => [g.name, g.cover, g.hero, g.logo, g.description, g.meta_id, g.scraping, g.screenshots.length, state.bust[g.id]].join('|');
+const artKey = g => [g.name, g.cover, g.hero, g.logo, g.description, g.meta_id, g.scraping, g.is_wishlist, g.wish_version, g.latest_version, g.version_status, g.version_checked_at, g.screenshots.length, state.bust[g.id]].join('|');
 
 function updateGameLive() {
   const g = game(state.route.id);
   if (!g) return;
+  if (g.is_wishlist) return;
   const running = isRunning(g);
   $('#st-last').textContent = running ? '现在' : (fmtAgo(g.last_played) || '从未');
   $('#st-time').textContent = fmtDuration(g.play_seconds);
@@ -597,6 +626,17 @@ function toggleRow(key, title, hint, on) {
 
 let savedPasswords = [];
 
+// 目录用途和路径优先，打开、更改为次要操作；沿用 --text、--text-2 和 8、12、24px 间距。
+function directoryRow(kind, label, path, canPick) {
+  return `<div class="directory-row">
+    <span class="setting-text"><span class="label">${label}</span><span class="directory-path">${esc(path)}</span></span>
+    <div class="directory-actions">
+      <button class="btn" data-open-dir="${kind}">${ICONS.folder}打开</button>
+      <button class="btn" data-pick-dir="${kind}" ${canPick ? '' : 'disabled title="请在软件窗口中更改"'}>更改</button>
+    </div>
+  </div>`;
+}
+
 function renderSettingsBody(s) {
   const body = $('#settings-body');
   if (!body) return;
@@ -630,14 +670,21 @@ function renderSettingsBody(s) {
         </div>
       </div>
     </section>
-    <section class="card">
+    <section class="card extract-settings">
       <h3>自动解压</h3>
-      <div class="inner">${toggleRow('delete_archive', '解压成功后删除压缩包', '关掉的话压缩包会留着，占双份空间。', s.delete_archive)}</div>
+      <div class="inner">
+        <div class="directory-list">
+          ${directoryRow('downloads', '下载文件夹 · 压缩包放这里', s.download_dirs.join('、'), s.native_window)}
+          ${directoryRow('games', '游戏文件夹 · 解压结果放这里', s.games_dir, s.native_window)}
+        </div>
+        <p class="hint">新解压的游戏统一放进 Game_000001 这样的编号目录，游戏库仍显示游戏名。</p>
+        ${toggleRow('delete_archive', '解压成功后删除压缩包', '所有层都解开后才删除；关掉则原包保留在下载文件夹。', s.delete_archive)}
+      </div>
     </section>
     <section class="card">
       <h3>解压密码 <span class="n">${s.passwords.length}</span></h3>
       <div class="inner">
-        <p class="hint">自动解压和导入压缩包时，从上到下逐个试。导入时手动输对的密码也会自动记到这里。</p>
+        <p class="hint password-hint">每一层分别试密码，内外层可以不同；也会从包内说明里找线索。导入时手动输对的密码会记到这里。</p>
         ${s.passwords.length ? `<ol class="pw-list">${s.passwords.map((p, i) => `
           <li><code>${esc(p)}</code><button class="icon-btn" data-pw-remove="${i}" title="删除这个密码" aria-label="删除这个密码">${ICONS.trash}</button></li>`).join('')}
         </ol>` : '<p class="muted">还没有密码。下载页面上写的解压密码，可以加在这里。</p>'}
@@ -720,6 +767,17 @@ async function saveSettings(changes) {
   }
 }
 
+
+async function pickDirectory(kind, btn) {
+  await busyButton(btn, '选择中', async () => {
+    const result = await api('POST', '/api/directories/pick', { kind });
+    if (!result.cancelled) {
+      renderSettingsBody(result);
+      toast('文件夹已更新');
+    }
+  });
+}
+
 async function addPassword(input) {
   const password = input.value.trim();
   if (!password) return input.focus();
@@ -761,6 +819,7 @@ function rename(id) {
 async function rescrape(id, btn) {
   const task = async () => {
     const r = await api('POST', `/api/games/${id}/rescrape`);
+    if (r.game_id && r.game_id !== id) location.hash = `#/game/${r.game_id}`;
     state.bust[id] = Date.now();
     toast(r.message);
     await load(true);
@@ -805,6 +864,12 @@ async function deleteGame(id) {
 
 // ---------------------------------------------------------------- 右键菜单
 function menuItems(g) {
+  if (g.is_wishlist) return [
+    {label: '查看详情', run: () => { location.hash = `#/game/${g.id}`; }},
+    {label: '检查版本', icon: ICONS.refresh, run: () => checkWish(g.id)},
+    {label: '关联已下载游戏', run: () => openWishAttach(g.id)},
+    {label: '移除记录', run: () => removeGame(g.id)},
+  ];
   return [
     g.platform === 'PC' && { label: isRunning(g) ? '运行中' : '开始游戏', icon: ICONS.play, strong: true, disabled: !canPlay(g), run: () => launch(g.id) },
     { label: '查看详情', run: () => { location.hash = `#/game/${g.id}`; } },
@@ -873,9 +938,15 @@ function menuItemByKey(key) {
 // ---------------------------------------------------------------- 匹配资料
 function openMatch(id) {
   state.matchId = id;
-  $('#match-q').value = game(id).name;
+  $('#match-title').textContent = id == null ? '添加到愿望单' : '匹配资料';
+  $('#match-help').textContent = id == null ? '输入名字或官网链接，选中作品后保存封面、简介和版本，不下载游戏文件。' : '输入游戏名或商店页面链接，选中正确的作品。';
+  $('#wish-baseline').hidden = id != null;
+  $('#wish-baseline-input').value = '';
+  $('#match-q').value = id == null ? '' : game(id).name;
+  $('#match-results').innerHTML = '';
   $('#match').showModal();
-  runSearch();
+  if (id != null) runSearch();
+  else $('#match-q').focus();
 }
 
 async function runSearch() {
@@ -915,18 +986,53 @@ async function useMatch(btn) {
   const r = state.matchResults[+btn.dataset.use];
   const id = state.matchId;
   $('#match-results').querySelectorAll('button').forEach(b => { b.disabled = true; });
-  btn.innerHTML = '<i class="spinner"></i>下载中';
+  btn.innerHTML = '<i class="spinner"></i>获取中';
   try {
-    await api('POST', `/api/games/${id}/match`, { source: r.source, id: r.id });
-    state.bust[id] = Date.now();
+    const result = await api('POST', id == null ? '/api/wishlist' : `/api/games/${id}/match`, { source: r.source, id: r.id, version: $('#wish-baseline-input').value.trim() });
+    const actualId = result.game_id || id;
+    state.bust[actualId] = Date.now();
     $('#match').close();
-    toast(`已换成「${r.title}」的资料`);
+    toast(id == null ? result.added ? '已加入愿望单' : '游戏库里已经有这款游戏' : `已换成「${r.title}」的资料`);
     await load(true);
+    if (id == null || actualId !== id) location.hash = `#/game/${actualId}`;
   } catch (e) {
     toast(e.message, true);
     runSearch();
   }
 }
+
+async function checkWish(id, btn) {
+  const task = async () => {
+    const result = await api('POST', `/api/wishlist/${id}/check`);
+    await load(true);
+    toast(result.message);
+  };
+  if (btn) return busyButton(btn, '检查中', task);
+  try { await task(); } catch (err) { toast(err.message, true); }
+}
+
+let wishAttachId = null;
+function openWishAttach(id) {
+  wishAttachId = id;
+  const local = state.games.filter(g => !g.is_wishlist && !g.missing && !isRunning(g));
+  $('#wish-local').innerHTML = local.length ? local.map(g => `<option value="${g.id}">${esc(g.name)}${g.version ? ' · v' + esc(g.version) : ''}</option>`).join('') : '<option value="">暂时没有可关联的本地游戏</option>';
+  $('#wish-attach-ok').disabled = !local.length;
+  $('#wish-attach').showModal();
+}
+
+$('#wish-attach').addEventListener('click', e => {
+  if (e.target.closest('[data-close]')) e.currentTarget.close();
+});
+$('#wish-attach-form').addEventListener('submit', e => {
+  e.preventDefault();
+  busyButton($('#wish-attach-ok'), '关联中', async () => {
+    const result = await api('POST', `/api/wishlist/${wishAttachId}/attach`, {local_id: +$('#wish-local').value});
+    $('#wish-attach').close();
+    await load(true);
+    location.hash = `#/game/${result.game_id}`;
+    toast('已关联，版本记录和备注已保留');
+  });
+});
 
 // ---------------------------------------------------------------- 截图查看
 function openViewer(i) {
@@ -947,7 +1053,7 @@ function showShot() {
 function parseRoute() {
   const m = location.hash.match(/^#\/game\/(\d+)/);
   if (m) state.route = { page: 'game', id: +m[1] };
-  else state.route = { page: location.hash === '#/settings' ? 'settings' : 'home' };
+  else state.route = { page: location.hash === '#/settings' ? 'settings' : location.hash === '#/wishlist' ? 'wishlist' : 'home' };
 }
 
 function renderView() {
@@ -961,7 +1067,7 @@ function renderAll(full) {
   renderSidebar();
   // 设置页只在整页刷新时画一次，定时刷新游戏列表时不重画，免得冲掉正在改的选项
   if (state.route.page === 'settings') return full && renderView();
-  if (full || state.route.page === 'home') return renderView();
+  if (full || ['home', 'wishlist'].includes(state.route.page)) return renderView();
   // 游戏页面：资料变了且没在打字时整页重画，否则只更新时长、按钮这些会变的地方
   const g = game(state.route.id);
   const typing = document.activeElement && document.activeElement.matches('#view input, #view textarea');
@@ -1003,6 +1109,7 @@ async function saveField(id, field, value) {
     if (state.route.page === 'home') renderHome();
     if (field === 'name' && $('#hero-name')) $('#hero-name').textContent = value;
     toast('已保存');
+    if (field === 'wish_version') await load(true);
   } catch (e) {
     toast(e.message, true);
   }
@@ -1369,12 +1476,12 @@ $('#side-list').addEventListener('click', e => {
 $('#search').addEventListener('input', e => {
   state.q = e.target.value;
   renderSidebar();
-  if (state.route.page === 'home') renderHome();
+  if (['home', 'wishlist'].includes(state.route.page)) renderHome();
 });
 $('#platform').addEventListener('change', e => {
   state.platform = e.target.value;
   renderSidebar();
-  if (state.route.page === 'home') renderHome();
+  if (['home', 'wishlist'].includes(state.route.page)) renderHome();
 });
 
 $('#now-playing').addEventListener('click', e => {
@@ -1401,7 +1508,16 @@ view.addEventListener('click', async e => {
   }
   const t = e.target.closest('button');
   if (!t) return;
+  if (t.hasAttribute('data-add-wish')) return openMatch(null);
+  if (t.hasAttribute('data-wish-check')) return checkWish(state.route.id, t);
+  if (t.hasAttribute('data-wish-attach')) return openWishAttach(state.route.id);
   if (t.dataset.itch) return itchAction(t.dataset.itch, t);
+  if (t.dataset.pickDir) return pickDirectory(t.dataset.pickDir, t);
+  if (t.dataset.openDir) {
+    try { await api('POST', `/api/directories/${t.dataset.openDir}/open`); }
+    catch (err) { toast(err.message, true); }
+    return;
+  }
   const id = state.route.id;
   if (t.hasAttribute('data-back')) return history.length > 1 ? history.back() : (location.hash = '#/');
   if (t.dataset.status) return setStatus(id, t.dataset.status);
@@ -1448,6 +1564,14 @@ view.addEventListener('click', async e => {
 view.addEventListener('change', async e => {
   const t = e.target;
   const id = state.route.id;
+  if (t.hasAttribute('data-wish-version')) {
+    try {
+      await api('PATCH', `/api/wishlist/${id}/version`, {version: t.value.trim()});
+      await load(true);
+      toast('版本已记录');
+    } catch (err) { toast(err.message, true); }
+    return;
+  }
   if (t.id === 'sort') { state.sort = t.value; localSet('sort', t.value); return renderHome(); }
   if (t.id === 'status-filter') { state.statusFilter = t.value; return renderHome(); }
   if (t.name === 'android') return saveSettings({ android: t.value });

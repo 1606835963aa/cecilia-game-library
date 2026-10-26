@@ -33,7 +33,9 @@ import zipfile
 import zlib
 from contextlib import contextmanager
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path, PurePosixPath
+from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.json"
@@ -45,6 +47,8 @@ EVENT_PREFIX = "__EXTRACT_EVENT__"
 
 DEFAULT_CONFIG = {
     "watch_dirs": ["games"],
+    "download_dirs": ["downloads"],
+    "games_dir": "games",
     "passwords": [],
     "seven_zip": "",
     "delete_archive": True,
@@ -74,7 +78,9 @@ SEVEN_ZIP_CANDIDATES = [
 
 TEMP_MARKERS = (".baiduyun.", ".downloading", ".tmp")
 IMPORTING_DIR = "_正在导入"  # 游戏库手动导入时在 games 里用的中转文件夹，扫描和监视都跳过它
-SKIP_DIRS = {".git", "data", "logs", "tmp", IMPORTING_DIR, "$RECYCLE.BIN", "System Volume Information"}
+PUBLISHING_DIR = "_正在整理"
+GAME_INFO = ".game-library.json"
+SKIP_DIRS = {".git", "data", "logs", "tmp", IMPORTING_DIR, PUBLISHING_DIR, "$RECYCLE.BIN", "System Volume Information"}
 
 ARCHIVE_MAGIC = (
     (b"PK\x03\x04", "zip"),
@@ -84,14 +90,14 @@ ARCHIVE_MAGIC = (
     (b"7z\xbc\xaf\x27\x1c", "7z"),
 )
 # 网盘里常把压缩包改成这些后缀躲审核（比如 .rar 改成 .pdf），只对这些后缀看文件头
-SNIFF_SUFFIXES = {"", ".pdf", ".jpg", ".png", ".mp4", ".iso", ".img", ".bin"}
+SNIFF_SUFFIXES = {"", ".txt", ".pdf", ".jpg", ".png", ".mp4", ".iso", ".img", ".bin"}
 
 PART_RAR = re.compile(r"^(?P<base>.+)\.part(?P<n>\d+)\.rar$", re.I)
 SEVEN_SPLIT = re.compile(r"^(?P<base>.+)\.(?:zip|rar|7z)\.(?P<n>\d{3})$", re.I)
 Z_SPLIT = re.compile(r"^(?P<base>.+)\.z\d{2}$", re.I)
 R_SPLIT = re.compile(r"^(?P<base>.+)\.r\d{2}$", re.I)
 PASSWORD_HINT = re.compile(
-    r"(?:解压密码|安装密码|二级解压密码|2级解压密码|解压码|密码)\s*[:：=]?\s*([^\s，。；、,;:：()（）\[\]【】\"'“”]+)"
+    r"(?:解压密码|安装密码|二级解压密码|2级解压密码|解压码|密码|password|pwd)\s*[:：=]?\s*([^\s，。；、,;:：()（）\[\]【】\"'“”]+)", re.I
 )
 
 
@@ -114,6 +120,8 @@ def load_config():
             user = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
             if isinstance(user, dict):
                 cfg.update(user)
+                if "games_dir" not in user:
+                    cfg["games_dir"] = (user.get("watch_dirs") or ["games"])[0]
         except (OSError, json.JSONDecodeError) as e:
             log(f"配置文件读取失败，使用默认设置：{e}")
     return cfg
@@ -135,6 +143,35 @@ def resolve_dir(value):
 
 def android_root(cfg):
     return resolve_dir(cfg.get("android_dir") or "android")
+
+
+def games_root(cfg):
+    return resolve_dir(cfg.get("games_dir") or "games")
+
+
+def download_roots(cfg):
+    return list(dict.fromkeys(resolve_dir(p) for p in cfg.get("download_dirs") or ["downloads"]))
+
+
+def validate_layout(cfg):
+    """下载目录和成品目录不能互相包含，否则又会扫到解压结果。"""
+    for source in download_roots(cfg):
+        for target in (games_root(cfg), android_root(cfg)):
+            if source == target or source in target.parents or target in source.parents:
+                raise ValueError("下载文件夹和游戏、安卓文件夹要分开，不能是同一个文件夹或互相包含")
+
+
+def game_label(folder):
+    """编号目录另存原名，让游戏库和资料匹配仍然使用游戏名。"""
+    try:
+        info = Path(folder) / GAME_INFO
+        if info.stat().st_size <= 16_384:
+            name = json.loads(info.read_text(encoding="utf-8")).get("name")
+            if isinstance(name, str) and name.strip():
+                return name.strip()[:300]
+    except (OSError, ValueError, AttributeError):
+        pass
+    return Path(folder).name
 
 
 def find_seven_zip(cfg):
@@ -169,7 +206,7 @@ def canon(name):
     """去掉站里用来防和谐的“删”后缀，只用来识别，不改真实文件名。"""
     name = name.rstrip()
     while name.endswith("删"):
-        name = name[:-1].rstrip()
+        name = name[:-1].rstrip(" .")
     return name
 
 
@@ -187,7 +224,7 @@ def human_size(num):
 
 def clean_name(path):
     name = canon(path.name)
-    suffixes = (".part1", ".001", ".z01", ".r00", ".zip", ".rar", ".7z")
+    suffixes = (".part1", ".001", ".z01", ".r00", ".zip", ".rar", ".7z", ".exe")
     changed = True
     while changed:
         changed = False
@@ -218,11 +255,11 @@ def archive_group(path):
 
     m = PART_RAR.match(name)
     if m:
-        if m.group("n") != "1":
+        if int(m.group("n")) != 1:
             return None
         base = m.group("base").lower()
         parts = _sibling_parts(parent, lambda p: bool(PART_RAR.match(canon(p.name)))
-                              and canon(p.name).lower().startswith(base + ".part"))
+                              and PART_RAR.match(canon(p.name)).group("base").lower() == base)
         return {"trigger": path, "parts": parts, "key": (parent / base).as_posix().lower()}
 
     m = SEVEN_SPLIT.match(name)
@@ -241,13 +278,20 @@ def archive_group(path):
     if low.endswith((".zip", ".rar", ".7z")):
         parts = [path]
         if low.endswith(".zip"):
-            parts += _sibling_parts(parent, lambda p: p.name.lower().endswith(".z01")
-                                   or (re.match(r"^.+\.z\d{2}$", p.name, re.I) is not None))
+            parts += _sibling_parts(parent, lambda p: bool(re.fullmatch(re.escape(name[:-4]) + r"\.z\d{2}", canon(p.name), re.I)))
         if low.endswith(".rar"):
-            parts += _sibling_parts(parent, lambda p: re.match(r"^.+\.r\d{2}$", p.name, re.I) is not None)
+            parts += _sibling_parts(parent, lambda p: bool(re.fullmatch(re.escape(name[:-4]) + r"\.r\d{2}", canon(p.name), re.I)))
         return {"trigger": path, "parts": sorted(set(parts)), "key": str(parent / name[:-4]).lower()}
 
-    if path.suffix.lower() in SNIFF_SUFFIXES:
+    if low.endswith(".exe"):
+        volumes = _sibling_parts(parent, lambda p: bool(re.fullmatch(re.escape(name[:-4]) + r"\.\d+\.sfxv", canon(p.name), re.I)))
+        if volumes:
+            volumes.sort(key=lambda p: int(re.search(r"\.(\d+)\.sfxv$", canon(p.name), re.I).group(1)))
+            return {"trigger": path, "parts": [path, *volumes], "key": str(path).lower(), "sfx": True}
+        if executable_archive(path):
+            return {"trigger": path, "parts": [path], "key": str(path).lower()}
+
+    if Path(name).suffix.lower() in SNIFF_SUFFIXES or re.search(r"\.(?:zip|rar|7z)\d+$", low):
         kind = sniff_archive(path)
         if kind:
             return {
@@ -271,6 +315,76 @@ def sniff_archive(path):
     return None
 
 
+def executable_archive(path):
+    if sniff_archive(path):
+        return True
+    try:
+        stat = path.stat()
+        return _executable_archive(str(path), stat.st_size, stat.st_mtime_ns, find_seven_zip(load_config()))
+    except OSError:
+        return False
+
+
+@lru_cache(maxsize=512)
+def _executable_archive(path, size, modified, seven):
+    """先看 PE 末尾附加的数据，再让 7-Zip 确认；普通主程序的资源段不能当压缩包。"""
+    if not seven:
+        return False
+    try:
+        with open(path, "rb") as file:
+            head = file.read(64)
+            if len(head) != 64 or not head.startswith(b"MZ"):
+                return False
+            offset = struct.unpack_from("<I", head, 60)[0]
+            if offset > size - 24:
+                return False
+            file.seek(offset)
+            header = file.read(24)
+            if not header.startswith(b"PE\0\0"):
+                return False
+            count = struct.unpack_from("<H", header, 6)[0]
+            optional_size = struct.unpack_from("<H", header, 20)[0]
+            if not 0 < count <= 96:
+                return False
+            file.seek(offset + 24 + optional_size)
+            sections = file.read(count * 40)
+            if len(sections) != count * 40:
+                return False
+            end = max(sum(struct.unpack_from("<II", sections, i * 40 + 16)) for i in range(count))
+            if end <= 0 or end >= size:
+                return False
+            file.seek(end)
+            overlay = file.read(1024 * 1024)
+            if not any(magic in overlay for magic, _ in ARCHIVE_MAGIC):
+                return False
+        _, listing = run_7z(seven, ["l", "-slt", "-sccUTF-8", "-p-", path], timeout=20)
+        kind = re.search(r"^Type = (.+)$", listing, re.M)
+        if kind:
+            return kind.group(1).strip().lower() in ("7z", "zip", "rar", "rar5")
+        # 文件头也加密时，7-Zip 在填对密码前只报告加密包，不输出格式字段。
+        return "encrypted archive" in listing.lower()
+    except (OSError, ValueError, struct.error, subprocess.TimeoutExpired):
+        return False
+
+
+@contextmanager
+def readable_group(group):
+    """分卷自解压包只拼接成数据文件，整个流程都由 7-Zip 读取。"""
+    if not group.get("sfx"):
+        yield group
+        return
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    combined = WORK_DIR / f"_sfx_{uuid4().hex}.exe"
+    try:
+        with combined.open("wb") as output:
+            for part in group["parts"]:
+                with part.open("rb") as source:
+                    shutil.copyfileobj(source, output, 8 * 1024 * 1024)
+        yield dict(group, trigger=combined, parts=[combined], sfx=False)
+    finally:
+        combined.unlink(missing_ok=True)
+
+
 def group_signature(group):
     sig = []
     for p in group["parts"]:
@@ -279,6 +393,25 @@ def group_signature(group):
         except OSError:
             sig.append((p.as_posix(), -1))
     return tuple(sig)
+
+
+def archive_complete(group):
+    """7z 头记录了末尾位置，缺分卷时不能把读取失败误报成密码错误。"""
+    trigger = group["trigger"]
+    if sniff_archive(trigger) != "7z" and not canon(trigger.name).lower().endswith(".exe"):
+        return True
+    try:
+        with trigger.open("rb") as source:
+            head = source.read(1024 * 1024)
+        offset = head.find(b"7z\xbc\xaf\x27\x1c")
+        header = head[offset:offset + 32] if offset >= 0 else b""
+        if len(header) != 32 or zlib.crc32(header[12:32]) & 0xffffffff != struct.unpack_from("<I", header, 8)[0]:
+            return True
+        next_offset, next_size = struct.unpack_from("<QQ", header, 12)
+        required = offset + 32 + next_offset + next_size
+        return sum(p.stat().st_size for p in group["parts"]) >= required
+    except (OSError, struct.error):
+        return False
 
 
 def group_ready(group, stable_seconds, seen):
@@ -583,12 +716,12 @@ def collect_hints(directory, extra=None, recursive=True):
     seen = set()
 
     def add(value):
-        value = (value or "").strip().strip("：:=。，,;；")
-        if not value or len(value) > 40:
+        value = str(value or "").strip().strip("：:=。，,;；")
+        if not value or len(value) > 256:
             return
-        if value.lower() in seen:
+        if value in seen:
             return
-        seen.add(value.lower())
+        seen.add(value)
         hints.append(value)
 
     for value in extra or []:
@@ -700,6 +833,53 @@ def organize(staging, dest, name, at_watch_root):
     return dest
 
 
+def publish_game(staging, dest, title=None):
+    """去掉单层包装目录，再完整放进编号目录；游戏内部的资源路径不改。"""
+    payload = staging
+    title = title or game_label(staging)
+    while True:
+        items = list(payload.iterdir())
+        directories = [p for p in items if p.is_dir()]
+        documents = [p for p in items if p.is_file()]
+        if (len(directories) != 1 or any(p.suffix.lower() not in (".txt", ".md", ".url", ".html", ".htm", ".pdf") for p in documents)):
+            break
+        child = directories[0]
+        if child.name.lower() not in ("pc", "windows", "win", "win64", "win32", "game", "games", "dist"):
+            title = child.name
+        for document in documents:
+            shutil.move(str(document), str(unique(child / document.name)))
+        payload = child
+    name = PASSWORD_HINT.sub("", str(title)).strip(" ._-") or "Game"
+    (payload / GAME_INFO).write_text(json.dumps({"name": name[:300]}, ensure_ascii=False) + "\n", encoding="utf-8")
+    dest.mkdir(parents=True, exist_ok=True)
+    incoming = dest / PUBLISHING_DIR / uuid4().hex
+    incoming.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        # 先搬到同一磁盘的隐藏中转目录，最终改名时扫描看不到半份游戏。
+        shutil.move(str(payload), str(incoming))
+        numbers = [int(p.name[5:]) for p in dest.iterdir() if re.fullmatch(r"Game_\d+", p.name)]
+        number = max(numbers, default=0) + 1
+        while True:
+            target = dest / f"Game_{number:06d}"
+            try:
+                if target.exists():
+                    number += 1
+                    continue
+                incoming.rename(target)
+                return target
+            except OSError:
+                if not target.exists():
+                    raise
+                number += 1
+    finally:
+        if incoming.exists():
+            shutil.rmtree(incoming)
+        try:
+            incoming.parent.rmdir()
+        except OSError:
+            pass
+
+
 def delete_group_files(group):
     removed = 0
     for part in group["parts"]:
@@ -711,120 +891,82 @@ def delete_group_files(group):
     return removed
 
 
-# ---------------------------------------------------------------- 自解压分卷
-def find_sfx_sets(directory):
-    sets = []
-    for dirpath, _dirnames, filenames in os.walk(directory):
-        base = Path(dirpath)
-        for fname in filenames:
-            if not fname.lower().endswith(".exe"):
-                continue
-            stem = fname[:-4]
-            vols = sorted(
-                (base / n for n in filenames
-                 if n.lower().startswith(stem.lower() + ".") and n.lower().endswith(".sfxv")),
-                key=lambda p: p.name.lower(),
-            )
-            if vols:
-                sets.append((base / fname, vols))
-    return sets
-
-
-def concat_sfx(exe_path, vols, out_path):
-    with open(out_path, "wb") as out:
-        for src in [exe_path] + vols:
-            with open(src, "rb") as f:
-                shutil.copyfileobj(f, out, length=8 * 1024 * 1024)
-
-
-def process_sfx(seven, exe_path, vols, dest, passwords, cfg, depth, watch_roots, progress=None, handled=None):
-    group = {"trigger": exe_path, "parts": [exe_path] + vols, "key": str(exe_path).lower()}
-    log(f"发现自解压分卷：{exe_path.name}（共 {len(vols) + 1} 个文件）")
-    WORK_DIR.mkdir(exist_ok=True)
-    combined = WORK_DIR / f"_sfx_{int(time.time() * 1000)}.exe"
-    try:
-        concat_sfx(exe_path, vols, combined)
-        sized = sum(p.stat().st_size for p in group["parts"])
-        log(f"  已拼接为临时文件（{human_size(sized)}），准备解压")
-        pwd, _out, note = choose_password(seven, combined, passwords)
-        if pwd is None and note not in ("无密码", "空压缩包"):
-            log(f"  自解压分卷跳过：{note}（可把密码加到 config.json）")
-            if progress:
-                progress({"phase": "result", "file": exe_path.name, "path": str(exe_path), "ok": False, "message": note})
-            return False
-        staging = WORK_DIR / "_staging_sfx"
-        rc, _ = extract_archive(seven, {"trigger": combined, "parts": [combined]}, pwd, staging)
-        if rc not in (0, 1):
-            log(f"  自解压分卷解压失败（退出码 {rc}）")
-            shutil.rmtree(staging, ignore_errors=True)
-            if progress:
-                progress({"phase": "result", "file": exe_path.name, "path": str(exe_path), "ok": False, "message": f"解压失败（退出码 {rc}）"})
-            return False
-        target = organize(staging, dest, exe_path.stem, True)
-        log(f"  已解压到：{target}")
-        if cfg.get("delete_archive", True):
-            delete_group_files(group)
-        if progress:
-            progress({"phase": "result", "file": exe_path.name, "path": str(exe_path), "ok": True, "message": "已解压"})
-        process_nested(seven, dest, passwords, cfg, depth - 1, watch_roots, progress, handled)
-        return True
-    finally:
-        try:
-            combined.unlink()
-        except OSError:
-            pass
-
-
 # ---------------------------------------------------------------- 嵌套压缩包
+def is_application_dir(directory, filenames, dirnames):
+    """已能运行的程序目录不再拆内部资源包、模组和存档。"""
+    names = {name.lower() for name in filenames}
+    exes = [Path(directory) / name for name in filenames if name.lower().endswith(".exe")]
+    dirs = {name.lower() for name in dirnames}
+    # 下载包也可能附带推广程序和 PC 子目录，只有运行资源的特征才算游戏目录。
+    resources = bool(dirs & {"game", "data", "www", "renpy", "engine", "content", "resources", "assets", "gamedata", "res", "lib"})
+    resources = resources or any(path.stem.lower() + "_data" in dirs for path in exes)
+    resources = resources or any(name.endswith((".dll", ".pck", ".rgss3a", ".rgss2a", ".rgssad")) for name in names)
+    return bool(exes and resources and any(not executable_archive(path) for path in exes))
+
+
 def iter_archives_in(directory):
     for dirpath, dirnames, filenames in os.walk(directory):
+        if is_application_dir(dirpath, filenames, dirnames):
+            dirnames[:] = []
+            continue
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith("_")]
         for fname in filenames:
             if is_temp_file(fname):
                 continue
             path = Path(dirpath) / fname
+            if clean_name(path).lower() in ("存档", "save", "saves", "savegame", "savegames"):
+                continue
             group = archive_group(path)
             if group:
                 yield group
 
 
-def process_nested(seven, directory, passwords, cfg, depth, watch_roots, progress=None, handled=None):
-    if depth <= 0:
-        return
+def process_nested(seven, directory, passwords, cfg, depth, watch_roots, progress=None, handled=None, android_archives=None):
     handled = handled if handled is not None else set()
-    for group in list(iter_archives_in(directory)):
-        if group["key"] in handled:
-            continue
+    android_archives = android_archives if android_archives is not None else []
+    groups = [g for g in iter_archives_in(directory) if g["key"] not in handled]
+    if depth <= 0:
+        return [f"{g['trigger'].name}：已达到套娃层数限制" for g in groups]
+    failures = []
+    for group in groups:
         handled.add(group["key"])
         trigger = group["trigger"]
+        if not trigger.exists():
+            continue
         parent = trigger.parent
         log(f"发现嵌套压缩包：{trigger.name}")
+        if not archive_complete(group):
+            message = "分卷还没下齐，或压缩包不完整"
+            failures.append(f"{trigger.name}：{message}")
+            if progress:
+                progress({"phase": "result", "file": trigger.name, "path": str(trigger), "ok": False, "message": message})
+            continue
         if progress:
             progress({"phase": "extracting", "file": trigger.name, "message": "正在解压里面的压缩包"})
-        hints = collect_hints(parent, passwords)
-        android_only = archive_is_android(seven, group, hints)
-        if android_only and divert_android_archive(group, cfg, watch_roots):
-            if progress:
-                progress({"phase": "result", "file": trigger.name, "path": str(trigger), "ok": True, "message": "安卓版已按设置处理"})
-            continue
-        staging = WORK_DIR / "_staging_nested"
-        ok, note = extract_to_staging(seven, group, hints, staging)
+        hints = collect_hints(directory, passwords)
+        staging = WORK_DIR / f"_nested_{uuid4().hex}"
+        with readable_group(group) as readable:
+            android_only = archive_is_android(seven, readable, hints)
+            if android_only and cfg.get("android") in ("archive", "delete"):
+                android_archives.append(group)
+                continue
+            ok, note = extract_to_staging(seven, readable, hints, staging)
         if not ok:
             shutil.rmtree(staging, ignore_errors=True)
             log(f"  跳过嵌套包：{note} —— {trigger.name}")
+            failures.append(f"{trigger.name}：{note}")
             if progress:
                 progress({"phase": "result", "file": trigger.name, "path": str(trigger), "ok": False, "message": note})
             continue
-        out_dir = output_dir(parent, android_only, watch_roots, cfg)
-        target = organize(staging, out_dir, clean_name(trigger), parent == directory or android_only)
-        log(f"  嵌套包已解压：{trigger.name}" + ("（安卓版，放进了安卓文件夹）" if android_only else ""))
-        if cfg.get("delete_archive", True):
-            delete_group_files(group)
-            if android_only:
-                prune_empty_parents(parent, watch_roots)
+        target = organize(staging, parent, clean_name(trigger), parent == directory)
+        log(f"  嵌套包已解压：{trigger.name}")
+        # 内层包是外层包里的副本，成品中只留解压后的内容。
+        delete_group_files(group)
         if progress:
             progress({"phase": "result", "file": trigger.name, "path": str(trigger), "ok": True, "message": "已解压"})
-        process_nested(seven, target if target.is_dir() else parent, passwords, cfg, depth - 1, watch_roots, progress, handled)
+        failures.extend(process_nested(seven, target if target.is_dir() else parent, hints, cfg, depth - 1,
+                                       watch_roots, progress, handled, android_archives))
+    return failures
 
 
 def rename_stripped(directory):
@@ -834,7 +976,7 @@ def rename_stripped(directory):
             if not name.endswith("删"):
                 continue
             src = Path(dirpath) / name
-            dst = src.with_name(name.rstrip("删").rstrip())
+            dst = src.with_name(canon(name))
             if src.exists() and not dst.exists():
                 try:
                     src.rename(dst)
@@ -919,9 +1061,9 @@ def sweep_android(directory, watch_roots, cfg):
 
 
 def output_dir(parent, android_only, watch_roots, cfg):
-    """解压到哪：只装着安卓版的压缩包解到安卓文件夹里对应的位置，其余解到压缩包旁边。"""
+    """PC 版统一进入游戏目录，安卓版沿用安卓目录。"""
     if not android_only:
-        return parent
+        return games_root(cfg)
     target = android_path(parent, watch_roots, cfg)
     target.mkdir(parents=True, exist_ok=True)
     return target
@@ -960,50 +1102,56 @@ def process_group(seven, group, cfg, passwords, watch_roots, into=None, progress
     trigger = group["trigger"]
     parent = trigger.parent
     log(f"发现压缩包：{trigger.name}（{human_size(trigger.stat().st_size)}）")
-    hints = collect_hints(parent, passwords, recursive=into is None)
-    android_only = archive_is_android(seven, group, hints)
-    if android_only and into is None and divert_android_archive(group, cfg, watch_roots):
-        return True, "安卓版"
-    staging = WORK_DIR / "_staging"
-    ok, note = extract_to_staging(seven, group, hints, staging)
-    if not ok:
-        shutil.rmtree(staging, ignore_errors=True)
-        log(f"  跳过：{note} —— {trigger.name}")
-        return False, note
-    if into is not None:
-        at_root = True
-        out_dir = android_root(cfg) if android_only else into
-        out_dir.mkdir(parents=True, exist_ok=True)
-    else:
-        at_root = any(parent == r for r in watch_roots) or android_only
-        out_dir = output_dir(parent, android_only, watch_roots, cfg)
-    dest = organize(staging, out_dir, group.get("name_override") or clean_name(trigger), at_root)
-    log(f"  已解压到：{dest}" + ("（安卓版）" if android_only else ""))
-    if into is None and cfg.get("delete_archive", True):
-        removed = delete_group_files(group)
-        log(f"  已删除压缩包 {removed} 个")
-        if android_only:
-            prune_empty_parents(parent, watch_roots)
-
-    all_pwds = collect_hints(dest, hints)
-    depth = int(cfg.get("nested_depth", 3))
-    # 保留原压缩包时，递归扫描不能把刚处理过的包再解一遍。
-    handled = {group["key"]}
-    while True:
-        sfx_sets = find_sfx_sets(dest)
-        if not sfx_sets:
+    if not archive_complete(group):
+        return False, "分卷还没下齐，或压缩包仍在下载"
+    if into is None:
+        validate_layout(cfg)
+    hints = collect_hints(parent, passwords, recursive=False)
+    for ancestor in parent.parents:
+        if not any(ancestor == root or root in ancestor.parents for root in watch_roots):
             break
-        for exe_path, vols in sfx_sets:
-            if not process_sfx(seven, exe_path, vols, dest, all_pwds, cfg, depth, watch_roots, progress, handled):
-                break
-        break
-    process_nested(seven, dest, all_pwds, cfg, depth, watch_roots, progress, handled)
-    rename_stripped(dest)
-    sweep_android(dest, watch_roots, cfg)
-    remove_empty_dirs(dest)
-    if dest.is_dir():
-        prune_empty_parents(dest, watch_roots)
-    return True, note
+        hints = collect_hints(ancestor, hints, recursive=False)
+    staging = WORK_DIR / f"_staging_{uuid4().hex}"
+    try:
+        with readable_group(group) as readable:
+            android_only = archive_is_android(seven, readable, hints)
+            if android_only and into is None and divert_android_archive(group, cfg, watch_roots):
+                return True, "安卓版"
+            ok, note = extract_to_staging(seven, readable, hints, staging)
+        if not ok:
+            log(f"  跳过：{note} —— {trigger.name}")
+            return False, note
+        all_pwds = collect_hints(staging, hints)
+        android_archives = []
+        failures = process_nested(seven, staging, all_pwds, cfg, int(cfg.get("nested_depth", 3)),
+                                  [staging], progress, android_archives=android_archives)
+        if failures:
+            # 全部解开才交给游戏库，内层失败时保留下载区的原包供补密码后重试。
+            return False, "里面的压缩包没解开，原包已保留：" + "；".join(failures[:3])
+        rename_stripped(staging)
+        for inner in android_archives:
+            if cfg.get("android") == "delete":
+                delete_group_files(inner)
+            else:
+                for part in inner["parts"]:
+                    move_to_android(part, [staging], cfg, strip=False)
+        sweep_android(staging, [staging], cfg)
+        remove_empty_dirs(staging)
+        title = group.get("name_override") or clean_name(trigger)
+        if android_only:
+            out_dir = output_dir(parent, True, watch_roots, cfg)
+            dest = organize(staging, out_dir, title, True)
+        elif any(staging.iterdir()):
+            dest = publish_game(staging, into if into is not None else games_root(cfg), title)
+        else:
+            dest = android_root(cfg)
+        log(f"  已解压到：{dest}")
+        if into is None and cfg.get("delete_archive", True):
+            removed = delete_group_files(group)
+            log(f"  已删除压缩包 {removed} 个")
+        return True, note
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 @contextmanager
@@ -1061,10 +1209,8 @@ def _scan_once(cfg, seven, state, seen, cooldown, force=False, progress=None):
         elif progress:
             progress(event)
 
-    watch_roots = []
-    for w in cfg["watch_dirs"]:
-        p = ROOT / w if not Path(w).is_absolute() else Path(w)
-        watch_roots.append(p.resolve())
+    validate_layout(cfg)
+    watch_roots = download_roots(cfg)
     found = 0
     stable = float(cfg.get("stable_seconds", 8))
     android_dir = android_root(cfg)
@@ -1099,6 +1245,9 @@ def _scan_once(cfg, seven, state, seen, cooldown, force=False, progress=None):
                 if not group:
                     continue
                 if str(path) in state:
+                    continue
+                if not archive_complete(group):
+                    report["waiting"] += 1
                     continue
                 if time.time() - cooldown.get(group["key"], 0) < 120:
                     continue
@@ -1167,9 +1316,12 @@ def watch_loop(cfg, seven, watch_dirs=None):
     seen = {}
     cooldown = {}
     log("开始监视，按 Ctrl+C 退出")
-    for w in cfg["watch_dirs"]:
-        p = ROOT / w if not Path(w).is_absolute() else Path(w)
+    validate_layout(cfg)
+    games_root(cfg).mkdir(parents=True, exist_ok=True)
+    for p in download_roots(cfg):
+        p.mkdir(parents=True, exist_ok=True)
         log(f"监视目录：{p}")
+    log(f"游戏目录：{games_root(cfg)}")
     log(f"安卓版：{ANDROID_MODES.get(cfg.get('android'), cfg.get('android'))}（安卓文件夹：{android_root(cfg)}）")
     while True:
         scan_once(cfg, seven, state, seen, cooldown)
@@ -1182,7 +1334,7 @@ def watch_loop(cfg, seven, watch_dirs=None):
             log("加了新密码，马上重试之前没解开的压缩包")
             cooldown.clear()
         if watch_dirs:
-            cfg["watch_dirs"] = watch_dirs
+            cfg["download_dirs"] = watch_dirs
 
 
 def main():
@@ -1195,7 +1347,7 @@ def main():
 
     cfg = load_config()
     if args.dir:
-        cfg["watch_dirs"] = args.dir
+        cfg["download_dirs"] = args.dir
     seven = find_seven_zip(cfg)
     if not seven:
         log("找不到 7z.exe，请安装 7-Zip，或在 config.json 的 seven_zip 里填路径")

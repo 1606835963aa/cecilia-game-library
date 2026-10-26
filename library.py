@@ -11,7 +11,7 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-from auto_extract import ROOT, SKIP_DIRS, android_root, is_temp_file, load_config, prune_empty_parents, resolve_dir
+from auto_extract import ROOT, SKIP_DIRS, android_root, game_label, games_root, is_temp_file, load_config, prune_empty_parents, resolve_dir
 
 DB_PATH = ROOT / "data" / "library.db"
 COVER_DIR = ROOT / "data" / "covers"
@@ -47,6 +47,14 @@ EXTRA_COLUMNS = {
     "meta_id": "TEXT DEFAULT ''",         # 在资料网站上的编号
     "scraped": "INTEGER DEFAULT 0",       # 1 = 已经自动找过资料，不再自动找
     "name_locked": "INTEGER DEFAULT 0",   # 1 = 名字手动改过，刮削不改名
+    "is_wishlist": "INTEGER DEFAULT 0",
+    "wishlisted_at": "TEXT DEFAULT ''",
+    "wish_version": "TEXT DEFAULT ''",
+    "latest_version": "TEXT DEFAULT ''",
+    "version_checked_at": "TEXT DEFAULT ''",
+    "version_status": "TEXT DEFAULT ''",
+    "version_evidence": "TEXT DEFAULT ''",
+    "version_history": "TEXT DEFAULT '[]'",
 }
 # 刮削能写的字段
 META_FIELDS = {"name", "cover", "hero", "logo", "screenshots", "description", "developer", "released",
@@ -211,9 +219,9 @@ def detect_game(folder):
     if not exe:
         return None
     # 认不出引擎时，要求有 dll 或子文件夹，避免把只装着一个汉化工具的文件夹当成游戏
-    if not engine and not dirs and not any(n.endswith(".dll") for n in files):
+    if not engine and not dirs and not any(n.endswith(".dll") for n in files) and ".game-library.json" not in files:
         return None
-    name, version = parse_name(folder.name)
+    name, version = parse_name(game_label(folder))
     return {
         "path": folder,
         "name": name,
@@ -435,9 +443,9 @@ def reset_image(game_id, kind):
 
 # ---------------------------------------------------------------- 扫描入库
 def watch_roots():
-    """要扫的文件夹：监视目录（games）加上安卓文件夹。"""
+    """游戏输出目录、额外游戏目录和安卓目录，不扫描下载区。"""
     cfg = load_config()
-    roots = [resolve_dir(w) for w in cfg.get("watch_dirs") or ["games"]]
+    roots = list(dict.fromkeys([games_root(cfg), *(resolve_dir(w) for w in cfg.get("watch_dirs") or [])]))
     android = android_root(cfg)
     if not any(r == android or r in android.parents for r in roots):
         roots.append(android)
@@ -457,7 +465,7 @@ def scan(full=False):
 
     added, added_ids = [], []
     with _db_lock, connect() as conn:
-        existing = {row["path"]: row for row in conn.execute("SELECT * FROM games")}
+        existing = {row["path"]: row for row in conn.execute("SELECT * FROM games WHERE is_wishlist=0")}
         # 文件夹（或 apk）被挪了位置：按名字认回原来那条记录，资料和游玩时长都留着
         gone = {}
         for rel, row in existing.items():
@@ -518,7 +526,7 @@ def describe(path, exe=""):
     if not exe:
         return detect_game(path)
     files, dirs = _files_and_dirs(path)
-    name, version = parse_name(path.name)
+    name, version = parse_name(game_label(path))
     return {"path": path, "name": name, "version": version, "platform": "PC",
             "engine": detect_engine(path, files, dirs)[0], "exe": exe, **scan_extras(path, files, exe)}
 
@@ -553,7 +561,7 @@ def games_under(path):
     """在这个文件夹里（或就是它）的游戏。"""
     path = Path(path).resolve()
     with connect() as conn:
-        rows = conn.execute("SELECT id, name, path FROM games").fetchall()
+        rows = conn.execute("SELECT id, name, path FROM games WHERE is_wishlist=0").fetchall()
     return [{"id": r["id"], "name": r["name"]} for r in rows
             if (p := to_abs(r["path"]).resolve()) == path or path in p.parents]
 
@@ -577,6 +585,7 @@ def list_games(running=None):
         g = dict(row)
         g["suspicious"] = json.loads(g["suspicious"] or "[]")
         g["screenshots"] = json.loads(g["screenshots"] or "[]")
+        g["version_history"] = json.loads(g["version_history"] or "[]")
         g["running_seconds"] = running.get(g["id"])
         games.append(g)
     return games
@@ -588,7 +597,7 @@ def get_game(game_id):
     return dict(row) if row else None
 
 
-EDITABLE = {"name", "version", "status", "rating", "tags", "notes"}
+EDITABLE = {"name", "version", "status", "rating", "tags", "notes", "wish_version"}
 
 
 def update_game(game_id, fields):
@@ -597,6 +606,10 @@ def update_game(game_id, fields):
         raise ValueError("状态不对")
     if "rating" in fields:
         fields["rating"] = max(0, min(5, int(fields["rating"])))
+    if "wish_version" in fields:
+        fields["wish_version"] = str(fields["wish_version"] or "").strip()
+        if len(fields["wish_version"]) > 80:
+            raise ValueError("版本号请控制在 80 个字以内")
     if "name" in fields and not str(fields["name"]).strip():
         raise ValueError("名字不能为空")
     if not fields:
@@ -633,20 +646,20 @@ def set_meta(game_id, fields):
 def unprocessed_games():
     """还没自动找过资料的游戏。"""
     with connect() as conn:
-        return [row["id"] for row in conn.execute("SELECT id FROM games WHERE scraped=0 AND missing=0")]
+        return [row["id"] for row in conn.execute("SELECT id FROM games WHERE scraped=0 AND missing=0 AND is_wishlist=0")]
 
 
 def folder_key(game):
     """文件夹名（apk 是文件名）拆出来的游戏名，不受后来改名影响。"""
     path = Path(game["path"])
-    return parse_name(path.stem if game["platform"] == "安卓" else path.name)[0].lower()
+    return parse_name(path.stem if game["platform"] == "安卓" else game_label(to_abs(game["path"])))[0].lower()
 
 
 def find_twin(game):
     """同一个游戏的 PC 版：资源站常把 PC 版和安卓版放在一起，文件夹名里的游戏名一样。"""
     key = folder_key(game)
     with connect() as conn:
-        rows = conn.execute("SELECT * FROM games WHERE platform='PC' AND id<>? AND missing=0", (game["id"],)).fetchall()
+        rows = conn.execute("SELECT * FROM games WHERE platform='PC' AND id<>? AND missing=0 AND is_wishlist=0", (game["id"],)).fetchall()
     return next((dict(r) for r in rows if folder_key(r) == key), None)
 
 
@@ -669,6 +682,8 @@ def send_to_recycle_bin(path):
 def delete_game_files(game_id):
     """把游戏文件移到回收站，再从游戏库移除。"""
     game = get_game(game_id)
+    if game["is_wishlist"]:
+        raise ValueError("这条记录还没有游戏文件，可以从愿望单移除")
     path = to_abs(game["path"]).resolve()
     roots, _ = watch_roots()
     if not any(r in path.parents for r in roots):

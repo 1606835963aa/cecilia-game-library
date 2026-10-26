@@ -17,6 +17,7 @@
     </a>
     <nav class="nav-links">
       <a href="#/" data-nav="home">主页</a>
+      <a href="#/wishlist" data-nav="wishlist">愿望单</a>
       <a href="#/settings" data-nav="settings">设置</a>
     </nav>
     <button id="now-playing" class="now-playing" hidden></button>
@@ -59,7 +60,7 @@
         <div id="import-menu" class="import-menu" role="menu" hidden>
           <button role="menuitem" data-import-pick="archives">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 8v12a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V8"/><path d="M1 3h22v5H1zM10 12h4"/></svg>
-            <span>选择压缩包<small>解压进 games 文件夹，分卷选第一份就行</small></span>
+            <span>选择压缩包<small>解压进游戏文件夹，分卷放在一起</small></span>
           </button>
           <button role="menuitem" data-import-pick="folder">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg>
@@ -101,8 +102,8 @@
 
   <dialog id="match" class="dialog dialog-wide">
     <div class="match-head">
-      <h2>匹配资料</h2>
-      <p>在 Steam、VNDB、DLsite、itch.io 上搜这个游戏，选中正确的那个，封面、横幅、简介和截图会一起换上。知道它在哪儿卖的话，直接粘贴商店页面链接最准，DLsite 的游戏也可以只填作品编号（RJ、VJ 等字母开头的那串）。</p>
+      <h2 id="match-title">匹配资料</h2>
+      <p id="match-help">输入游戏名或商店页面链接，选中正确的作品。</p>
       <form id="match-form" class="match-search">
         <label class="search big">
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
@@ -110,12 +111,25 @@
         </label>
         <button class="btn btn-primary">搜索</button>
       </form>
+      <div class="field wish-baseline" id="wish-baseline" hidden>
+        <label for="wish-baseline-input">加入时版本（可选）</label>
+        <input id="wish-baseline-input" type="text" maxlength="80" placeholder="比如 0.2；留空会尝试从官网获取">
+      </div>
     </div>
     <div id="match-results" class="match-results"></div>
     <div class="dialog-btns match-foot">
       <span class="hint">搜不到也没关系，可以在游戏页面右边「外观」里自己换封面和背景。</span>
       <button class="btn" data-close>关闭</button>
     </div>
+  </dialog>
+
+  <dialog id="wish-attach" class="dialog">
+    <form id="wish-attach-form">
+      <h2>关联已下载的游戏</h2>
+      <div class="field"><label for="wish-local">本地游戏</label><select id="wish-local"></select></div>
+      <p class="wish-help">保留愿望单的版本记录和备注，关联后就能开始游戏。</p>
+      <div class="dialog-btns"><button type="button" class="btn" data-close>取消</button><button class="btn btn-primary" id="wish-attach-ok">关联</button></div>
+    </form>
   </dialog>
 
   <!-- 当前任务优先，文件结果其次，关闭为主要按钮；沿用 --text 配色和 12、24px 间距。 -->

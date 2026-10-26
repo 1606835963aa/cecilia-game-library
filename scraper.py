@@ -26,6 +26,7 @@ from datetime import datetime
 from pathlib import Path
 
 import library
+import wishlist
 from auto_extract import load_config
 
 try:
@@ -121,6 +122,39 @@ def normalize(text):
     """比较名字用：只留字母、数字和中日文，忽略大小写、空格和标点。"""
     text = re.sub(r"【[^】]*】", "", (text or "").lower().replace("’", "'"))  # DLsite 标题前的【中文版】之类
     return re.sub(r"[^0-9a-z぀-ヿ一-鿿]+", "", text)
+
+
+VERSION_NUMBER = r"(\d+(?:\.\d+){1,4}(?:[ -]?(?:alpha|beta|rc|a|b)\d*)?)"
+
+
+def version_fields(title="", description="", page=""):
+    """只认明确标注的版本和当前下载文件名，更新日期、历史版本列表不能当当前版本。"""
+    def unique(values):
+        values = list(dict.fromkeys(v.strip() for v in values))
+        return values[0] if len(values) == 1 else ""
+
+    candidates = (
+        (re.findall(r"(?:latest|current|最新|当前)\s*(?:version|版本|バージョン)?\s*[:：=]?\s*v?" + VERSION_NUMBER, description, re.I), "官网说明"),
+        (re.findall(r"(?:\bv(?:er(?:sion)?\.?)?|版本|バージョン)\s*[:：=]?\s*" + VERSION_NUMBER, title, re.I), "作品标题"),
+        (re.findall(r"[\[【(（]\s*v?" + VERSION_NUMBER + r"\s*[\]】)）]", title, re.I), "作品标题"),
+        (re.findall(r'["\']softwareVersion["\']\s*:\s*["\']v?' + VERSION_NUMBER, page, re.I), "官网版本字段"),
+        (re.findall(r"^\s*(?:version|版本|バージョン)\s*[:：=]?\s*v?" + VERSION_NUMBER, description, re.I | re.M), "官网说明"),
+    )
+    for values, evidence in candidates:
+        value = unique(values)
+        if value:
+            return {"online_version": value, "version_evidence": evidence}
+    names = re.findall(r'<[^>]+class=["\'][^"\']*\bupload_name\b[^"\']*["\'][^>]*>(.*?)</(?:div|span)>', page, re.S | re.I)
+    versions = []
+    for name in names:
+        filename = re.match(r"(.+?\.(?:zip|7z|rar|exe|apk|tar(?:\.gz|\.bz2)?))(?=\s|$)", html_text(name), re.I)
+        if not filename:
+            continue
+        for value in re.findall(r"(?:^|[\s_\-])v?" + VERSION_NUMBER + r"(?=[\s_.\-]|$)", filename.group(1), re.I):
+            if not re.fullmatch(r"20\d{2}\.\d{1,2}\.\d{1,2}", value):
+                versions.append(value)
+    value = unique(versions)
+    return {"online_version": value, "version_evidence": "官网下载文件名" if value else ""}
 
 
 # ---------------------------------------------------------------- 游戏文件
@@ -486,6 +520,7 @@ def steam_details(appid):
     release = d.get("release_date") or {}
     return {
         "source": "steam", "id": appid, "title": d.get("name", ""),
+        **version_fields(d.get("name", ""), html_text(d.get("detailed_description") or "")),
         "description": html.unescape(re.sub(r"<[^>]+>", "", d.get("short_description") or "")).strip(),
         "developer": "、".join(d.get("developers") or []),
         "released": release.get("date", ""),
@@ -532,6 +567,7 @@ def vndb_details(vid):
     portrait = h > w * 1.1
     return {
         "source": "vndb", "id": vid, "title": v.get("title", ""),
+        **version_fields(v.get("title", ""), clean_bbcode(v.get("description"))),
         "description": clean_bbcode(v.get("description")),
         "developer": "、".join(d["name"] for d in v.get("developers") or []),
         "released": v.get("released") or "",
@@ -587,6 +623,7 @@ def dlsite_details(code):
     shots = re.findall(r'(//img\.dlsite\.jp/modpub/images2/work/[^"\'\s]+?_img_smp\d+\.(?:jpg|png|webp))', page)
     return {
         "source": "dlsite", "id": code, "title": dlsite_title(info.get("work_name")),
+        **version_fields(dlsite_title(info.get("work_name")), html_text(inner_div(page, 'itemprop="description"')), page),
         "description": html_text(inner_div(page, 'itemprop="description"')),
         "developer": maker.group(1) if maker else "",
         "released": (info.get("regist_date") or "")[:10],
@@ -678,6 +715,7 @@ def itch_details(url):
     genres = [g.strip() for k in ("Genre", "Tags") for g in html_text(rows.get(k, "")).split(",") if g.strip()]
     return {
         "source": "itch", "id": url, "title": data.get("title", ""),
+        **version_fields(data.get("title", ""), html_text(inner_div(page, 'class="formatted_description')), page),
         "description": html_text(inner_div(page, 'class="formatted_description')),
         "developer": "、".join(a["name"] for a in data.get("authors") or []),
         "released": itch_date(published.group(1)) if published else "",
@@ -796,8 +834,8 @@ def refresh_site_icon(game_id):
 
 def apply(game_id, meta, local):
     """把找到的资料和图片存下来。手动换过的封面、横幅大图和手动改过的名字不动。"""
-    game = library.get_game(game_id)
     meta = meta or {}
+    game = library.get_game(game_id)
     urls = {k: meta.get(k, "") for k in ("cover", "hero", "logo", "icon")}
     shot_urls = meta.get("screenshots") or []
     with ThreadPoolExecutor(6) as pool:
@@ -815,10 +853,16 @@ def apply(game_id, meta, local):
         images["hero"] = local_hero
     images["logo"] = images["logo"] or local["logo"]
 
-    for f in library.COVER_DIR.glob(f"{game_id}-shot*.jpg"):
-        f.unlink(missing_ok=True)
+    keep_shots = bool(shot_urls and not shots and game["meta_source"] == meta.get("source")
+                      and str(game["meta_id"]) == str(meta.get("id")) and game["screenshots"] not in ("", "[]"))
+    if not keep_shots:
+        for f in library.COVER_DIR.glob(f"{game_id}-shot*.jpg"):
+            f.unlink(missing_ok=True)
     fields = {}
     for kind, ext in (("cover", "jpg"), ("hero", "jpg"), ("logo", "png")):
+        if (images[kind] is None and urls[kind] and game["meta_source"] == meta.get("source")
+                and str(game["meta_id"]) == str(meta.get("id")) and game[kind]):
+            continue
         name = f"{game_id}-{kind}.{ext}"
         if images[kind] is not None:
             library.save_image(images[kind], name, kind)
@@ -839,7 +883,8 @@ def apply(game_id, meta, local):
             (library.COVER_DIR / site_icon).unlink(missing_ok=True)
             native_icon = f"{game_id}-icon.png"
             fields["icon"] = native_icon if (library.COVER_DIR / native_icon).is_file() else ""
-    fields["screenshots"] = [library.save_image(img, f"{game_id}-shot{i}.jpg", "shot") for i, img in enumerate(shots)]
+    if not keep_shots:
+        fields["screenshots"] = [library.save_image(img, f"{game_id}-shot{i}.jpg", "shot") for i, img in enumerate(shots)]
     fields.update(
         description=meta.get("description", ""), developer=meta.get("developer", ""),
         released=meta.get("released", ""), genres="、".join(meta.get("genres") or []),
@@ -849,11 +894,16 @@ def apply(game_id, meta, local):
     if new_name and not game["name_locked"]:
         fields["name"] = new_name
     library.set_meta(game_id, fields)
+    if meta.get("source"):
+        wishlist.record_version(game_id, meta.get("online_version"), meta.get("version_evidence", ""))
+    fields["game_id"] = game_id
     return fields
 
 
 def local_for(game):
     """游戏文件里的资料。安卓版的 apk 读不了，借同一个游戏 PC 版的。返回 (资料, PC 版)。"""
+    if game["is_wishlist"]:
+        return {"name": game["name"], "hero": None, "logo": None}, None
     twin = library.find_twin(game) if game["platform"] != "PC" else None
     return local_info(twin or game), twin
 
@@ -866,6 +916,12 @@ def auto_scrape(game_id, online=True):
     game = library.get_game(game_id)
     if not game or game["missing"]:
         return "游戏不在了", True
+    if game["is_wishlist"]:
+        if not online:
+            return "愿望单资料已保存在本机", True
+        meta = DETAILS[game["meta_source"]](game["meta_id"])
+        apply(game_id, meta, local_for(game)[0])
+        return "愿望单资料和版本已更新", True
     local, twin = local_for(game)
     names = [twin and twin["name"], local["name"], game["name"]]
     meta, reachable = None, True
@@ -908,7 +964,40 @@ def apply_match(game_id, source, item_id):
 def clear(game_id):
     """去掉网上找来的资料，只保留游戏文件里取到的图。"""
     game = library.get_game(game_id)
+    if game["is_wishlist"]:
+        raise ValueError("愿望单需要保留官网来源，如不再关注可移除这条记录")
     apply(game_id, None, local_for(game)[0])
+
+
+def add_wishlist(source, item_id, baseline=""):
+    if source not in DETAILS:
+        raise ValueError("请选择一个搜索结果")
+    meta = DETAILS[source](str(item_id))
+    if not str(meta.get("title") or "").strip():
+        raise LookupError("官网没有返回游戏名，请检查作品链接")
+    game_id, added = wishlist.create(meta, baseline)
+    if added:
+        try:
+            apply(game_id, meta, local_for(library.get_game(game_id))[0])
+            wishlist.set_initial_version(game_id, meta.get("online_version"), baseline, meta.get("version_evidence", ""))
+        except Exception:
+            library.remove_game(game_id)
+            raise
+    return {"game_id": game_id, "added": added}
+
+
+def check_wishlist_version(game_id):
+    game = library.get_game(game_id)
+    if not game or not game["wishlisted_at"] or game["meta_source"] not in DETAILS:
+        raise ValueError("这条记录没有可检查的官网来源")
+    try:
+        meta = DETAILS[game["meta_source"]](game["meta_id"])
+        version = meta.get("online_version", "")
+        wishlist.record_version(game_id, version, meta.get("version_evidence", ""))
+        return "已检查，官网版本：" + version if version else "已检查，官网没有明确标注版本号"
+    except Exception:
+        wishlist.record_version(game_id, "", status="error")
+        raise
 
 
 # ---------------------------------------------------------------- 后台队列
@@ -921,13 +1010,17 @@ class Worker:
         self.lock = threading.Lock()
         self.pending = set()
 
-    def enqueue(self, ids, icons_only=False):
+    def enqueue(self, ids, icons_only=False, versions_only=False):
         with self.lock:
             for gid in ids:
                 if gid not in self.pending:
                     self.pending.add(gid)
                     game = library.get_game(gid) or {}
-                    self.queue.put((game.get("platform") != "PC", gid, icons_only))
+                    self.queue.put((game.get("platform") != "PC", gid, "version" if versions_only else "icon" if icons_only else "auto"))
+
+    def enqueue_versions(self):
+        if load_config().get("auto_scrape", True):
+            self.enqueue([g["id"] for g in library.list_games() if g["wishlisted_at"] and not g["missing"]], versions_only=True)
 
     def enqueue_icons(self):
         if load_config().get("auto_scrape", True):
@@ -939,11 +1032,13 @@ class Worker:
 
     def loop(self):
         while True:
-            _, gid, icons_only = self.queue.get()
+            _, gid, task = self.queue.get()
             try:
                 online = bool(load_config().get("auto_scrape", True))
                 game = library.get_game(gid)
-                if icons_only:
+                if task == "version":
+                    msg = check_wishlist_version(gid) if online else ""
+                elif task == "icon":
                     msg = refresh_site_icon(gid) if online else ""
                 else:
                     msg, _ = auto_scrape(gid, online=online)
