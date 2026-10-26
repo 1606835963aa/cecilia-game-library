@@ -53,8 +53,9 @@ except ImportError as e:
 import importer
 import library
 import scraper
+from itch_account import ItchAccount
 from window_frame import CustomFrame
-from auto_extract import ANDROID_MODES, ROOT, android_root, load_config, save_config
+from auto_extract import ANDROID_MODES, EVENT_PREFIX, ROOT, android_root, find_seven_zip, load_config, save_config
 
 WEB_DIR = ROOT / "web"
 ICON = WEB_DIR / "icon.ico"
@@ -170,6 +171,91 @@ worker = scraper.Worker(log)
 imports = importer.Importer(log, worker.enqueue)
 
 
+class RefreshRunner:
+    """解压放在独立进程，既不阻塞页面，也不占用手动导入的中转文件夹。"""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.state = {"id": 0, "running": False, "phase": "idle", "message": "", "results": []}
+
+    def snapshot(self):
+        with self.lock:
+            return self.snapshot_unlocked()
+
+    def busy(self):
+        with self.lock:
+            return self.state["running"]
+
+    def update(self, **fields):
+        with self.lock:
+            self.state.update(fields)
+
+    def start(self):
+        with self.lock:
+            if self.state["running"]:
+                return self.snapshot_unlocked()
+            if not find_seven_zip(load_config()):
+                raise ValueError("没找到 7-Zip，装上后才能解压")
+            self.state = {
+                "id": self.state["id"] + 1, "running": True, "phase": "checking",
+                "message": "正在检查下载文件夹", "file": "", "results": [],
+                "processed": 0, "succeeded": 0, "failed": 0, "waiting": 0,
+            }
+            state = self.snapshot_unlocked()
+        threading.Thread(target=self.run, daemon=True).start()
+        return state
+
+    def snapshot_unlocked(self):
+        return dict(self.state, results=list(self.state["results"]))
+
+    def run(self):
+        try:
+            # pythonw 没有标准输出，改用同一套 Python 的控制台入口并隐藏黑窗口，才能读取进度。
+            python = Path(sys.executable)
+            if python.name.lower() == "pythonw.exe":
+                python = python.with_name("python.exe")
+            command = [str(python), "-u", "-X", "utf8", str(ROOT / "auto_extract.py"), "--once", "--events"]
+            report = None
+            with subprocess.Popen(command, cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, encoding="utf-8", errors="replace",
+                                  creationflags=subprocess.CREATE_NO_WINDOW) as proc:
+                for line in proc.stdout:
+                    if not line.startswith(EVENT_PREFIX):
+                        continue
+                    event = json.loads(line[len(EVENT_PREFIX):])
+                    phase = event.get("phase")
+                    if phase == "result":
+                        with self.lock:
+                            self.state["results"].append({k: event[k] for k in ("file", "ok", "message")})
+                            self.state["results"] = self.state["results"][-100:]
+                    elif phase == "finished":
+                        report = {k: event[k] for k in ("processed", "succeeded", "failed", "waiting")}
+                    else:
+                        self.update(phase=phase, message=event.get("message", ""), file=event.get("file", ""))
+                returncode = proc.wait()
+            if returncode or report is None:
+                raise ValueError("解压程序没能完成，请查看 logs 文件夹里的 extract.log")
+            self.update(phase="scanning", message="正在更新游戏列表", file="", **report)
+            result = scan_and_queue(full=True)
+            parts = []
+            if report["succeeded"]:
+                parts.append(f"已处理 {report['succeeded']} 项")
+            if report["failed"]:
+                parts.append(f"{report['failed']} 个没解开")
+            if report["waiting"]:
+                parts.append(f"{report['waiting']} 个还在下载，下载完再刷新")
+            parts.append(f"新入库 {len(result['added'])} 个游戏" if result["added"] else f"没有新游戏（共 {result['total']} 个）")
+            message = "，".join(parts)
+            self.update(running=False, phase="done", message=message, added=result["added"], total=result["total"])
+            log(f"刷新完成：{message}")
+        except Exception as e:
+            log(f"刷新失败：{e}")
+            self.update(running=False, phase="error", message=str(e), file="")
+
+
+refresh = RefreshRunner()
+
+
 # ---------------------------------------------------------------- 网页接口
 app = FastAPI()
 app.mount("/web", StaticFiles(directory=WEB_DIR), name="web")
@@ -254,6 +340,8 @@ def scan_and_queue(full=False):
     if result["added"]:
         log(f"新入库：{'、'.join(result['added'])}")
         worker.enqueue(result["added_ids"])
+    if full:
+        worker.enqueue_icons()
     return result
 
 
@@ -263,12 +351,25 @@ async def api_scan(request: Request):
     return scan_and_queue(full=bool(body.get("full")))
 
 
+@app.get("/api/refresh")
+def api_refresh_status():
+    return refresh.snapshot()
+
+
+@app.post("/api/refresh")
+def api_refresh():
+    try:
+        return refresh.start()
+    except (OSError, ValueError) as e:
+        raise HTTPException(400, str(e))
+
+
 @app.get("/api/search")
 def api_search(q: str):
     if not q.strip():
         return {"results": [], "errors": []}
     results, errors = scraper.search(q.strip())
-    return {"results": results, "errors": errors}
+    return {"results": results, "errors": errors, "itch_account": shell.itch.snapshot()}
 
 
 @app.post("/api/games/{game_id}/match")
@@ -472,6 +573,7 @@ def api_settings():
         "theme": current_theme(),
         "themes": {k: v["label"] for k, v in THEMES.items()},
         "passwords": [str(p) for p in cfg.get("passwords") or []],
+        "itch_account": shell.itch.snapshot(),
     }
 
 
@@ -494,6 +596,41 @@ async def api_save_settings(request: Request):
     if "theme" in updates:
         shell.paint_title_bar()
     return api_settings()
+
+
+@app.get("/api/itch/account")
+def api_itch_account():
+    return shell.itch.snapshot()
+
+
+def require_native_window():
+    if not shell.window:
+        raise HTTPException(400, "请在游戏库软件窗口里登录 itch.io")
+
+
+@app.post("/api/itch/login")
+async def api_itch_login(request: Request):
+    require_native_window()
+    body = await request.json() if await request.body() else {}
+    try:
+        return await run_blocking(shell.itch.open, bool(body.get("settings")))
+    except (OSError, ValueError) as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/itch/check")
+def api_itch_check():
+    require_native_window()
+    return shell.itch.check_async(retry=True)
+
+
+@app.delete("/api/itch/login")
+def api_itch_logout():
+    require_native_window()
+    try:
+        return shell.itch.logout()
+    except (OSError, ValueError) as e:
+        raise HTTPException(400, str(e))
 
 
 # 解压密码：每次都在当下的设置文件上加减一个，不整份覆盖，免得冲掉导入时刚记下的密码
@@ -585,6 +722,12 @@ class Shell:
         self.hidden = False
         self.maximized = False
         self.state = {}
+        self.ready = threading.Event()
+        self.itch = ItchAccount(self, self.on_itch_ready, log)
+
+    def on_itch_ready(self):
+        if load_config().get("auto_scrape", True):
+            worker.enqueue([g["id"] for g in library.list_games() if not g["meta_source"] and not g["missing"]])
 
     def run(self, url):
         try:
@@ -637,12 +780,19 @@ class Shell:
         switched = []
 
         def enable():
-            settings = self.window.native.browser.webview.CoreWebView2.Settings
+            core = self.window.native.browser.webview.CoreWebView2
+            settings = core.Settings
+            # 登录留在官网，账号密码也不交给浏览器的自动保存功能。
+            if hasattr(core.Profile, "IsPasswordAutosaveEnabled"):
+                core.Profile.IsPasswordAutosaveEnabled = False
+            if hasattr(core.Profile, "IsGeneralAutofillEnabled"):
+                core.Profile.IsGeneralAutofillEnabled = False
             if not settings.IsNonClientRegionSupportEnabled:
                 settings.IsNonClientRegionSupportEnabled = True
                 switched.append(True)
 
         self.on_ui_thread(enable)
+        self.ready.set()
         if switched:
             self.window.evaluate_js("location.reload()")
             return
@@ -657,15 +807,21 @@ class Shell:
             self.window.evaluate_js(f"window.importDropped({json.dumps(paths)})")
 
     def on_closing(self):
-        if tracker.active() or imports.busy():
+        if tracker.active() or imports.busy() or refresh.busy():
             self.hidden = True
+            if self.itch.window:
+                self.itch.visible = False
+                self.itch.window.hide()
             self.window.hide()
             if tracker.active():
                 log("窗口藏起来了，游戏还在运行，玩完会自动记下时长再退出")
-            else:
+            elif imports.busy():
                 log("窗口藏起来了，还在导入游戏，导入完再退出")
+            else:
+                log("窗口藏起来了，还在解压和刷新，完成后再退出")
             return False
         self.save_state()
+        self.itch.shutdown()
 
     def save_state(self):
         state = dict(self.state, maximized=self.maximized)
@@ -690,7 +846,8 @@ class Shell:
     def exit_when_idle(self):
         while True:
             time.sleep(PlayTracker.CHECK_SECONDS)
-            if self.hidden and not tracker.active() and not imports.busy():
+            if self.hidden and not tracker.active() and not imports.busy() and not refresh.busy():
+                self.itch.shutdown()
                 self.window.destroy()
                 return
 
@@ -722,6 +879,8 @@ def main():
         return
 
     library.init_db()
+    if not args.browser:
+        scraper.itch_browser = shell.itch
     log("正在扫描游戏文件夹……")
     result = library.scan()
     log(f"游戏库里共 {result['total']} 个游戏" + (f"，新入库 {len(result['added'])} 个" if result["added"] else ""))
@@ -735,6 +894,7 @@ def main():
     imports.cleanup()
     threading.Thread(target=imports.loop, daemon=True).start()
     worker.enqueue(library.unprocessed_games())
+    worker.enqueue_icons()
     while not server.started:
         time.sleep(0.1)
 

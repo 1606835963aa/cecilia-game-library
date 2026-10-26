@@ -651,7 +651,63 @@ function renderSettingsBody(s) {
       <h3>游戏资料</h3>
       <div class="inner">${toggleRow('auto_scrape', '新游戏自动联网找资料', '会把游戏名发给 Steam、VNDB、DLsite 和 itch.io 搜索。关掉后只从游戏文件里取，联网要在游戏页面手动点「匹配资料」。', s.auto_scrape)}</div>
     </section>
+    <section class="card" id="itch-account-card">
+      <h3>itch.io 账号</h3>
+      <div class="inner" id="itch-account"></div>
+    </section>
     <p class="hint">改完马上保存。正在运行的自动解压，下一轮扫描就会用上新设置。</p>`;
+  renderItchAccount(s.itch_account);
+}
+
+// 登录状态优先，登录或官网设置是主要操作；沿用 --text、--text-2 和 8、12、16px 间距。
+const itchUi = { account: null, json: '', polling: false };
+
+function renderItchAccount(account) {
+  if (!account) return;
+  itchUi.account = account;
+  itchUi.json = JSON.stringify(account);
+  const container = $('#itch-account');
+  if (!container) return;
+  const signed = account.status === 'signed_in';
+  let hint = signed ? '搜索会使用这个账号，自动找资料和手动匹配都能用。' : '在官网窗口登录后，开启成人内容并保存。';
+  if (signed && account.adult !== true) hint = '在官网设置中开启成人内容并保存，再点「检查登录」。';
+  if (!account.available) hint = '请用「打开游戏库.bat」打开软件窗口后登录。';
+  const disabled = !account.available || account.clearing;
+  container.innerHTML = `
+    <div class="itch-status" role="status" aria-live="polite">
+      ${account.checking ? '<i class="spinner"></i>' : `<span class="itch-dot ${signed ? 'signed' : ''}"></span>`}
+      <span>${esc(account.checking ? '正在检查登录……' : account.message)}</span>
+    </div>
+    <p class="itch-hint">${esc(hint)}</p>
+    <div class="itch-actions">
+      <button class="btn btn-primary" data-itch="${signed ? 'settings' : 'login'}" ${disabled ? 'disabled' : ''}>${signed ? '官网设置' : account.status === 'expired' ? '重新登录' : '登录 itch.io'}</button>
+      <button class="btn" data-itch="check" ${disabled || account.checking ? 'disabled' : ''}>检查登录</button>
+      <button class="link subtle" data-itch="logout" ${disabled ? 'disabled' : ''}>退出并清除登录</button>
+    </div>`;
+}
+
+async function pollItchAccount() {
+  if (itchUi.polling || state.route.page !== 'settings') return;
+  itchUi.polling = true;
+  try {
+    const account = await api('GET', '/api/itch/account');
+    const json = JSON.stringify(account);
+    if (json !== itchUi.json) {
+      itchUi.json = json;
+      renderItchAccount(account);
+    }
+  } catch { /* 下次再检查，不打断正在修改的其他设置 */ }
+  finally { itchUi.polling = false; }
+}
+
+async function itchAction(action, btn) {
+  await busyButton(btn, action === 'logout' ? '清除中' : '处理中', async () => {
+    const method = action === 'logout' ? 'DELETE' : 'POST';
+    const path = action === 'check' ? '/api/itch/check' : '/api/itch/login';
+    const account = await api(method, path, action === 'settings' ? { settings: true } : undefined);
+    renderItchAccount(account);
+    if (action === 'logout') toast('itch.io 已退出');
+  });
 }
 
 async function saveSettings(changes) {
@@ -828,11 +884,14 @@ async function runSearch() {
   if (!q) return;
   box.innerHTML = Array.from({ length: 4 }, () => '<div class="m-row skeleton"><div class="m-thumb"></div><div class="m-info"><i></i><i></i></div></div>').join('');
   try {
-    const { results, errors } = await api('GET', `/api/search?q=${encodeURIComponent(q)}`);
+    const { results, errors, itch_account: account } = await api('GET', `/api/search?q=${encodeURIComponent(q)}`);
     if (q !== $('#match-q').value.trim()) return;
     state.matchResults = results;
     const g = game(state.matchId);
-    const note = errors.length ? `<div class="m-note">${errors.map(s => SOURCES[s].label).join('、')} 这次没连上，结果可能不全。</div>` : '';
+    const itchIssue = account && (['expired', 'verification', 'error'].includes(account.status) || account.status === 'signed_in' && account.adult === false);
+    const otherErrors = errors.filter(s => s !== 'itch' || !itchIssue);
+    let note = otherErrors.length ? `<div class="m-note">${otherErrors.map(s => SOURCES[s].label).join('、')} 这次没连上，结果可能不全。</div>` : '';
+    if (itchIssue) note += `<div class="m-note">itch.io：${esc(account.message)}。<button class="link" data-itch-settings>去设置</button></div>`;
     box.innerHTML = note + (results.length ? results.map((r, i) => {
       const current = g && g.meta_source === r.source && g.meta_id === r.id;
       const meta = [r.year, r.developer].filter(Boolean).map(esc).join('<i class="dot"></i>');
@@ -972,6 +1031,81 @@ async function busyButton(btn, text, task) {
   } finally {
     btn.disabled = false;
     btn.innerHTML = html;
+  }
+}
+
+// ---------------------------------------------------------------- 刷新与解压
+const refreshing = { job: null, timer: null, starting: false, polling: false };
+
+function renderRefresh() {
+  const job = refreshing.job;
+  if (!job) return;
+  const btn = $('#scan');
+  btn.classList.toggle('spinning', job.running);
+  btn.setAttribute('aria-busy', String(job.running));
+  btn.querySelector('span').textContent = job.running ? '刷新中' : '刷新';
+  btn.title = job.running ? '正在刷新，点击查看进度' : '检查新压缩包、自动解压，再更新游戏列表和占用空间';
+  $('#refresh-message').textContent = job.message || '正在检查下载文件夹';
+  const active = job.running ? `
+    <div class="i-row job refresh-row">
+      <span class="i-state"><i class="spinner"></i></span>
+      <div><div class="refresh-name">${esc(job.file || job.message)}</div>
+        ${job.file ? `<div class="i-msg">${esc(job.message)}</div>` : ''}</div>
+    </div>` : '';
+  const rows = [...job.results].reverse().map(item => `
+    <div class="i-row job refresh-row">
+      <span class="i-state ${item.ok ? 'done' : 'failed'}">${item.ok ? ICONS.check : ICONS.warn}</span>
+      <div><div class="refresh-name">${esc(item.file)}</div>
+        <div class="i-msg ${item.ok ? '' : 'failed'}">${esc(item.message)}</div></div>
+    </div>`).join('');
+  $('#refresh-results').innerHTML = active + rows || `<div class="refresh-empty">${job.phase === 'error' ? ICONS.warn : ICONS.check}<span>${job.phase === 'error' ? '刷新没能完成' : job.waiting ? '有文件还在下载，下载完再刷新' : '下载文件夹已检查'}</span></div>`;
+}
+
+async function pollRefresh(quiet = false) {
+  clearTimeout(refreshing.timer);
+  if (refreshing.polling) return;
+  refreshing.polling = true;
+  try {
+    const previous = refreshing.job;
+    const job = await api('GET', '/api/refresh');
+    // 页面刚打开时的旧查询可能晚于点击刷新返回，不能把新任务盖回旧状态。
+    if (refreshing.job && job.id < refreshing.job.id) {
+      refreshing.timer = setTimeout(pollRefresh, 1000);
+      return;
+    }
+    refreshing.job = job;
+    if (job.id) renderRefresh();
+    if (!job.running && previous?.running) {
+      await load(true);
+      if (!quiet && !$('#refresh-dialog').open) toast(job.message, job.phase === 'error' || job.failed > 0);
+    }
+    if (job.running) refreshing.timer = setTimeout(pollRefresh, 1000);
+  } catch {
+    refreshing.timer = setTimeout(pollRefresh, 3000);
+  } finally {
+    refreshing.polling = false;
+  }
+}
+
+async function startRefresh() {
+  const dialog = $('#refresh-dialog');
+  if (refreshing.job?.running) {
+    if (!dialog.open) dialog.showModal();
+    return;
+  }
+  if (refreshing.starting) return;
+  refreshing.starting = true;
+  $('#scan').disabled = true;
+  try {
+    refreshing.job = await api('POST', '/api/refresh');
+    renderRefresh();
+    if (!dialog.open) dialog.showModal();
+    pollRefresh();
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    refreshing.starting = false;
+    $('#scan').disabled = false;
   }
 }
 
@@ -1248,20 +1382,13 @@ $('#now-playing').addEventListener('click', e => {
   if (id) location.hash = `#/game/${id}`;
 });
 
-$('#scan').addEventListener('click', async e => {
-  const btn = e.currentTarget;
-  btn.disabled = true;
-  btn.classList.add('spinning');
-  try {
-    const r = await api('POST', '/api/scan', { full: true });
-    toast(r.added.length ? `新入库 ${r.added.length} 个：${r.added.join('、')}，正在后台找资料` : `扫描完成，没有新游戏（共 ${r.total} 个）`);
-    await load(true);
-  } catch (err) {
-    toast(err.message, true);
-  } finally {
-    btn.disabled = false;
-    btn.classList.remove('spinning');
-  }
+$('#scan').addEventListener('click', startRefresh);
+$('#refresh-dialog').addEventListener('click', e => {
+  if (e.target.closest('[data-close]')) e.currentTarget.close();
+});
+$('#refresh-settings').addEventListener('click', () => {
+  $('#refresh-dialog').close();
+  location.hash = '#/settings';
 });
 
 const view = $('#view');
@@ -1274,6 +1401,7 @@ view.addEventListener('click', async e => {
   }
   const t = e.target.closest('button');
   if (!t) return;
+  if (t.dataset.itch) return itchAction(t.dataset.itch, t);
   const id = state.route.id;
   if (t.hasAttribute('data-back')) return history.length > 1 ? history.back() : (location.hash = '#/');
   if (t.dataset.status) return setStatus(id, t.dataset.status);
@@ -1475,6 +1603,11 @@ importDialog.addEventListener('close', () => {
 
 $('#match-form').addEventListener('submit', e => { e.preventDefault(); runSearch(); });
 $('#match').addEventListener('click', e => {
+  if (e.target.closest('[data-itch-settings]')) {
+    e.currentTarget.close();
+    location.hash = '#/settings';
+    return;
+  }
   const use = e.target.closest('[data-use]');
   if (use) return useMatch(use);
   if (e.target.closest('[data-close]') || e.target === e.currentTarget) e.currentTarget.close();
@@ -1537,3 +1670,5 @@ parseRoute();
 load(true);
 setInterval(load, POLL_MS);
 pollImports(true);
+pollRefresh(true);
+setInterval(pollItchAccount, 2000);

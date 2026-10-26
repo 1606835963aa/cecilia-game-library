@@ -11,7 +11,7 @@
 | 自动解压 | `auto_extract.py`（`启动自动解压.bat`） | 常驻监视 `games` 文件夹，等文件下完后解压、试密码、整理文件夹、删压缩包 |
 | 游戏库 | `game_manager.py`（`打开游戏库.bat`，用 `pythonw` 启动） | FastAPI 本机小网站 + pywebview 窗口（WebView2），扫描入库、找资料、启动计时、手动导入 |
 
-两个进程不直接通信，只共用 `config.json`（设置）和文件系统。各自每轮重新读 `config.json`，所以在游戏库设置页改的东西，自动解压下一轮就会用上。
+两个常驻进程共用 `config.json`（设置）和文件系统。各自每轮重新读 `config.json`，所以在游戏库设置页改的东西，自动解压下一轮就会用上。游戏库点「刷新」时另外启动一次性解压子进程（`auto_extract.py --once --events`），通过标准输出读取进度，完成后扫描入库。刷新和独立监视通过 `data/extract.lock` 互斥，避免同时处理同一个压缩包。
 
 ## 环境
 
@@ -26,8 +26,9 @@
 | `auto_extract.py` | 解压引擎和基础工具：`load_config` / `save_config`、`DEFAULT_CONFIG`、`ROOT`、分卷识别（`archive_group`）、试密码（`choose_password`，一次把所有候选都试完）、GBK 密码 zip 自解密、套娃解压、安卓版分流、`scan_once` / `watch_loop` |
 | `library.py` | SQLite 数据库（`data/library.db`，表 `games` 和 `sessions`）、引擎识别、主程序挑选、扫描入库、图标提取、低完整性标签修复、回收站删除 |
 | `scraper.py` | 找资料：游戏文件本地读取（Ren'Py rpa、Godot pck、RPG Maker、Unity）+ Steam / VNDB / DLsite / itch.io；`Worker` 是后台排队线程 |
+| `itch_account.py` | itch.io 官网登录窗口、登录和成人内容状态检测、同一浏览器会话中的搜索、退出清理；登录状态由 WebView2 保存在 `data/webview` |
 | `importer.py` | 手动导入：识别拖进来的路径，挪 / 复制 / 原地登记 / 解压；`Importer` 是后台排队线程，复用 `auto_extract.process_group` |
-| `game_manager.py` | FastAPI 路由（`/api/*`）、`PlayTracker` 计时、`Shell` 窗口生命周期、单实例、皮肤的标题栏颜色 |
+| `game_manager.py` | FastAPI 路由（`/api/*`）、`PlayTracker` 计时、`RefreshRunner` 刷新解压、`Shell` 窗口生命周期、单实例、皮肤的标题栏颜色 |
 | `window_frame.py` | 自绘标题栏：Win32 子类化去掉系统标题栏，保留系统边框 |
 | `web/index.html` | 页面骨架，含占位符 `__TOKEN__` `__THEME__` `__FRAME__` `__VERSION__`，由 `game_manager.index()` 替换 |
 | `web/app.js` | 全部前端逻辑，原生 JS，无框架、无打包。路由用 hash：`#/`、`#/game/<id>`、`#/settings` |
@@ -71,6 +72,7 @@ python auto_extract.py --once
 - **接口鉴权**：中间件 `guard` 只放行 Host 是 `127.0.0.1` / `localhost` 的请求；`/api/*` 还要带 `X-Token`，口令每次启动随机生成，写进页面的 `<meta name="token">`。新接口放在 `/api/` 下就自动受保护。
 - **页面缓存**：`/` 和 `/web/*` 都返回 `Cache-Control: no-cache`，静态文件地址带 `?v=<web 文件最新修改时间>`。新加的 CSS / JS 文件也要在 `index.html` 里带 `?v=__VERSION__`。
 - **WebView2 线程**：碰 `window.native` 下的 WebView2 对象必须走 `Shell.on_ui_thread`，在别的线程直接读写会让两边卡死。
+- **itch.io 登录**：官网窗口不挂本机 `js_api`；登录信息不进设置接口、日志或 `config.json`。搜索通过官网窗口内同源请求执行，公开作品详情仍用普通 HTTP 请求。退出只清理 itch.io 的 Cookie，不清理游戏库页面数据；关主窗口时要销毁隐藏的官网窗口。
 - **拖放导入**：完整文件路径只有 Python 这边拿得到（`Shell.on_drop` 里的 `pywebviewFullPath`），再通过 `window.importDropped(...)` 交给页面。
 - **改设置**：`save_config(updates)` 只合并给出的键。密码列表的增删接口（`/api/passwords`、`/api/passwords/remove`）每次在当下的文件上加减一个，不整份覆盖，因为导入线程也会往里写密码。
 - **两边同时解压**：导入用 `data/import` 当中转文件夹（`importer.py` 里改了 `auto_extract.WORK_DIR`），自动解压用 `data/`；导入时在 `games` 里用的中转文件夹叫 `_正在导入`，它在 `SKIP_DIRS` 里，游戏库扫描和自动解压都跳过；自动解压还会跳过所有以 `_` 开头的文件夹。

@@ -91,7 +91,7 @@ i.dot { display: inline-block; width: 3px; height: 3px; margin: 0 8px; border-ra
   background: var(--nav); box-shadow: 0 1px 0 #0b0d11;
 }
 .brand { display: flex; align-items: center; gap: 10px; font-size: 15px; font-weight: 700; letter-spacing: 2px; color: #fff; }
-.brand img { width: 22px; height: 22px; }
+.brand img { width: 44px; height: 32px; object-fit: contain; flex: none; }
 .nav-links { display: flex; gap: 22px; }
 .nav-links a {
   height: 52px; display: flex; align-items: center; color: var(--text-3);
@@ -112,7 +112,7 @@ i.dot { display: inline-block; width: 3px; height: 3px; margin: 0 8px; border-ra
 .summary { color: var(--text-4); font-size: 12px; white-space: nowrap; }
 .nav-btn {
   display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 12px; border-radius: var(--r-sm);
-  background: var(--surface-2); border: 0; color: var(--text-2); cursor: pointer;
+  background: var(--surface-2); border: 0; color: var(--text-2); cursor: pointer; white-space: nowrap; flex: none;
 }
 .nav-btn:hover { background: var(--surface-3); color: #fff; }
 .nav-btn:disabled { opacity: .6; cursor: default; }
@@ -452,6 +452,15 @@ select:focus-visible { box-shadow: 0 0 0 1px var(--blue-soft); outline: 0; }
 .page-title { margin: 0 0 20px; font-size: 24px; font-weight: 800; color: #fff; }
 .settings { display: grid; gap: 20px; }
 .settings .label { color: var(--text); font-weight: 600; }
+.itch-status { display: flex; align-items: center; gap: 8px; color: var(--text); font-weight: 600; }
+.itch-status .spinner { margin: 0; }
+.itch-dot { width: 8px; height: 8px; flex: none; border-radius: 50%; background: var(--text-3); }
+.itch-dot.signed { background: var(--green-text); }
+.itch-hint { margin: 8px 0 16px; color: var(--text-2); line-height: 1.6; }
+.itch-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+.itch-actions .btn-primary, .itch-actions .btn-primary:hover { background: var(--blue-soft); color: var(--nav); }
+.itch-actions .link { color: var(--text-2); }
+.itch-actions .link:disabled { opacity: .5; cursor: default; }
 .setting-row { display: flex; align-items: center; gap: 16px; cursor: pointer; }
 .setting-row .btn { flex: none; }
 .setting-text { flex: 1; min-width: 0; display: grid; gap: 2px; }
@@ -675,6 +684,17 @@ select:focus-visible { box-shadow: 0 0 0 1px var(--blue-soft); outline: 0; }
 .check input { width: 16px; height: 16px; margin: 0; accent-color: #3592ea; }
 .import-foot { padding: 14px 24px 18px; border-top: 1px solid var(--line); }
 .import-foot .hint { margin-right: auto; }
+
+/* 刷新窗口沿用导入列表，文字换行以便看清完整文件名和失败原因。 */
+.refresh-dialog { width: min(640px, calc(100vw - 32px)); }
+.refresh-dialog .import-head p { color: var(--text-2); overflow-wrap: anywhere; }
+.refresh-row { grid-template-columns: 18px minmax(0, 1fr); }
+.refresh-row > div { min-width: 0; }
+.refresh-row .i-msg { overflow-wrap: anywhere; }
+.refresh-name { color: var(--text); font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+.refresh-empty { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 40px 24px; color: var(--text-2); }
+.refresh-empty svg { width: 20px; height: 20px; flex: none; }
+#refresh-settings { margin-right: auto; }
 
 .viewer {
   width: 100vw; height: 100vh; max-width: none; max-height: none; margin: 0; padding: 0; border: 0;

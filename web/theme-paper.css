@@ -1,8 +1,6 @@
 /* 皮肤「浪子的真情」：奶白纸底、淡绿剪纸层次、纸张纹理。
-   配色和塞西莉亚花标志同一家族：主绿 #24735D、灰绿 #87B6A0、象牙白 #F4F8EF、花心粉 #D9939B。
+   配色承接竖琴与绿色披风标志：主绿 #24735D、灰绿 #87B6A0、象牙白 #F4F8EF，粉色 #D9939B 用于界面点缀。
    只在 <html data-theme="paper"> 时生效，默认的经典深色不受影响。 */
-
-.brand-flower { display: none; width: 26px; height: 26px; stroke: none; }
 
 [data-theme="paper"] {
   --nav: #f7f5ec;
@@ -82,8 +80,6 @@
   background: var(--scallop) repeat-x; filter: drop-shadow(0 2px 1.5px rgba(38, 71, 59, .14));
 }
 [data-theme="paper"] .brand { color: var(--ink); font-family: var(--serif); letter-spacing: 3px; }
-[data-theme="paper"] .brand img { display: none; }
-[data-theme="paper"] .brand-flower { display: block; }
 [data-theme="paper"] .nav-links a { color: var(--text-3); border-bottom-width: 0; position: relative; }
 [data-theme="paper"] .nav-links a.active { color: var(--ink); }
 [data-theme="paper"] .nav-links a.active::after {
@@ -311,6 +307,7 @@
 [data-theme="paper"] .i-state.done { color: var(--leaf); }
 [data-theme="paper"] .i-state.failed,
 [data-theme="paper"] .i-msg.failed { color: var(--rose-ink); }
+[data-theme="paper"] .refresh-row .i-msg.failed { color: var(--ink); }
 [data-theme="paper"] .i-state .spinner { color: var(--leaf); }
 [data-theme="paper"] .i-bar i { background: var(--sage); }
 [data-theme="paper"] .seg label { background: #fffdf7; box-shadow: inset 0 0 0 1px var(--line); }

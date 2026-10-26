@@ -1,4 +1,5 @@
 """游戏库：扫描游戏文件夹，认出游戏（引擎、主程序、名字、版本），存进数据库。"""
+import hashlib
 import io
 import json
 import os
@@ -34,7 +35,7 @@ _db_lock = threading.Lock()
 
 # games 表里刮削和显示用的字段，老数据库启动时自动补上
 EXTRA_COLUMNS = {
-    "icon": "TEXT DEFAULT ''",            # 从主程序取出的图标
+    "icon": "TEXT DEFAULT ''",            # 主程序或官网的小图标
     "hero": "TEXT DEFAULT ''",            # 游戏页面顶部的横幅大图
     "logo": "TEXT DEFAULT ''",            # 透明底的游戏 Logo
     "screenshots": "TEXT DEFAULT '[]'",   # 截图文件名列表
@@ -49,8 +50,21 @@ EXTRA_COLUMNS = {
 }
 # 刮削能写的字段
 META_FIELDS = {"name", "cover", "hero", "logo", "screenshots", "description", "developer", "released",
-               "genres", "meta_source", "meta_id", "scraped"}
-IMAGE_SIZES = {"cover": (900, 1350), "hero": (2560, 1440), "logo": (1200, 600), "shot": (1600, 900)}
+               "genres", "meta_source", "meta_id", "scraped", "icon"}
+IMAGE_SIZES = {"cover": (900, 1350), "hero": (2560, 1440), "logo": (1200, 600), "shot": (1600, 900), "icon": (256, 256)}
+# Ren'Py runtime/renpy_icon.ico、Godot platform/windows/godot.ico 的各尺寸默认图标。
+ENGINE_ICON_HASHES = frozenset({
+    "c0033ec048d689fa8d5bef11368ae713debabf6cce7eee1571b37158fbbbfbcc",
+    "a1d97903ccbce2179f0f2b9ab7c759995e4b116ad82749183fe44bde36925a2c",
+    "d9b5bcac59ea25761572abd2d17584502ac48a5ad11a5dea2482feae57beadfc",
+    "a4588207125c073bbb9b11c2f1b9e9c01af5bbc305d3ab2aee9d090898958c90",
+    "03aed84a38bc4ba45ea3cb11b99720a8e00183a6b21974a71e5d75aa45ca77a5",
+    "aeae826cd91c376b20e26057781375098908a143ca28f5dbf351a1220ae40970",
+    "2e3dc4c67d483209cc1b0b3fc30cd1403a2e76c2b1cb8d4ee36bf1c6e1942e56",
+    "8f8003c39fa54d88d74677060866e312a89089b31de8c20924bebcd3ee4eb547",
+    "0fadc037481d7202841d179f26fe15d77cce1fad4ba697875a6e3ab22b800e20",
+    "2807032f439f514405cc2ca624b8c6b6d82af93afc08ba3dd861b052289a4e7e",
+})
 
 
 # ---------------------------------------------------------------- 数据库
@@ -328,6 +342,22 @@ def ensure_normal_integrity(folder, exe):
 
 
 # ---------------------------------------------------------------- 封面
+def is_engine_icon(name):
+    """只认像素一致的引擎默认图标，不能仅凭引擎名称替换游戏自己的图标。"""
+    from PIL import Image
+
+    try:
+        with Image.open(COVER_DIR / name) as image:
+            if image.width != image.height or image.width not in (16, 32, 48, 64, 128, 256):
+                return False
+            # 透明区域的隐藏颜色可能不同，合成到同一底色后再比对。
+            background = Image.new("RGBA", image.size, "white")
+            pixels = Image.alpha_composite(background, image.convert("RGBA")).convert("RGB")
+            return hashlib.sha256(pixels.tobytes()).hexdigest() in ENGINE_ICON_HASHES
+    except (OSError, ValueError, Image.DecompressionBombError):
+        return False
+
+
 def extract_icon(exe_path, out_path):
     """从 exe 里取出最大的那个图标存成 png。只把 exe 当数据读，不会运行它。"""
     try:

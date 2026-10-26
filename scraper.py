@@ -562,7 +562,8 @@ def dlsite_info(codes):
 
 
 def dlsite_search(term):
-    url = f"{DLSITE}/suggest/?" + urllib.parse.urlencode({"term": term, "site": "adult-jp", "time": 1})
+    params = {"term": term, "site": "adult-jp", "time": int(datetime.now().timestamp() * 1000), "touch": 0}
+    url = f"{DLSITE}/suggest-api/global-search?" + urllib.parse.urlencode(params)
     works = (get_json(url, headers=DLSITE_HEADERS).get("work") or [])[:8]
     info = dlsite_info([w["workno"] for w in works]) if works else {}
     results = []
@@ -621,6 +622,7 @@ def find_dlsite_code(game):
 
 # ---------------------------------------------------------------- itch.io
 ITCH_GAME = re.compile(r"https?://([\w-]+)\.itch\.io/([\w-]+)", re.I)
+itch_browser = None
 
 
 def itch_url(text):
@@ -637,7 +639,8 @@ def itch_date(text):
 
 
 def itch_search(term):
-    page = get_text("https://itch.io/search?" + urllib.parse.urlencode({"q": term}))
+    url = "https://itch.io/search?" + urllib.parse.urlencode({"q": term})
+    page = itch_browser.search_page(url) if itch_browser else get_text(url)
     results = []
     for cell in re.split(r'class="game_cell[ "]', page)[1:9]:
         tag = re.search(r'<a\b([^>]*class="title game_link"[^>]*)>([^<]*)</a>', cell)
@@ -651,6 +654,13 @@ def itch_search(term):
                         "thumb": thumb.group(1) if thumb else "", "year": "",
                         "developer": html.unescape(author.group(1)) if author else ""})
     return results
+
+
+def itch_icon(page, url):
+    """取作品网页声明的小图标，兼容链接属性的不同顺序。"""
+    tag = re.search(r'<link\b[^>]*\brel=["\'](?:shortcut\s+)?icon["\'][^>]*>', page, re.I)
+    href = re.search(r'\bhref=["\']([^"\']+)', tag.group(0), re.I) if tag else None
+    return urllib.parse.urljoin(url, html.unescape(href.group(1))) if href else ""
 
 
 def itch_details(url):
@@ -675,6 +685,7 @@ def itch_details(url):
         # itch.io 的封面是横版宣传图，当横幅大图用；页面顶部的标题图如果是透明底就当 Logo
         "cover": "", "hero": key_art.group(1) if key_art else data.get("cover_image", ""),
         "logo": header.group(1) if header else "",
+        "icon": itch_icon(page, url),
         "screenshots": shots[:MAX_SCREENSHOTS],
     }
 
@@ -743,11 +754,51 @@ def exact_match(term, results):
     return None
 
 
+def can_update_site_icon(game):
+    """官网图标只补空缺、失效缓存和已确认的引擎默认图标。"""
+    name = game["icon"] or ""
+    return "-custom" not in name and (
+        not name or name == f"{game['id']}-site-icon.png"
+        or not (library.COVER_DIR / name).is_file() or library.is_engine_icon(name)
+    )
+
+
+def needs_site_icon(game):
+    """只给已匹配的作品补图，已有官网图标不重复下载。"""
+    name = game["icon"] or ""
+    return (
+        not game["missing"] and game["meta_source"] == "itch" and bool(itch_url(game["meta_id"]))
+        and (name != f"{game['id']}-site-icon.png" or not (library.COVER_DIR / name).is_file())
+        and can_update_site_icon(game)
+    )
+
+
+def refresh_site_icon(game_id):
+    """沿用已选定的作品地址，只补小图标，不重新搜索或改动其他资料。"""
+    game = library.get_game(game_id)
+    if not game or not needs_site_icon(game):
+        return ""
+    url = itch_url(game["meta_id"])
+    image = download_image(itch_icon(get_text(url), url))
+    if image is None:
+        return "官网暂时没有可用的小图标"
+    with library._db_lock, library.connect() as conn:
+        current = conn.execute("SELECT * FROM games WHERE id=?", (game_id,)).fetchone()
+        # 下载期间可能手动换了资料，不能把旧作品的图标写回去。
+        if (not current or current["missing"] or current["meta_source"] != game["meta_source"]
+                or current["meta_id"] != game["meta_id"] or current["icon"] != game["icon"]
+                or not can_update_site_icon(current)):
+            return ""
+        name = library.save_image(image, f"{game_id}-site-icon.png", "icon")
+        conn.execute("UPDATE games SET icon=? WHERE id=?", (name, game_id))
+    return "已补上官网小图标"
+
+
 def apply(game_id, meta, local):
     """把找到的资料和图片存下来。手动换过的封面、横幅大图和手动改过的名字不动。"""
     game = library.get_game(game_id)
     meta = meta or {}
-    urls = {k: meta.get(k, "") for k in ("cover", "hero", "logo")}
+    urls = {k: meta.get(k, "") for k in ("cover", "hero", "logo", "icon")}
     shot_urls = meta.get("screenshots") or []
     with ThreadPoolExecutor(6) as pool:
         images = dict(zip(urls, pool.map(download_image, urls.values())))
@@ -776,6 +827,18 @@ def apply(game_id, meta, local):
             name = ""
         if "-custom" not in (game[kind] or ""):
             fields[kind] = name
+    # 没有图标或只有引擎默认图标时用官网图标，游戏自己的图标仍然保留。
+    site_icon = f"{game_id}-site-icon.png"
+    current = library.get_game(game_id) or game
+    current_icon = current["icon"] or ""
+    if can_update_site_icon(current):
+        if images["icon"] is not None:
+            fields["icon"] = library.save_image(images["icon"], site_icon, "icon")
+        elif (current_icon == site_icon and not urls["icon"]
+              and (meta.get("source"), meta.get("id")) != (game["meta_source"], game["meta_id"])):
+            (library.COVER_DIR / site_icon).unlink(missing_ok=True)
+            native_icon = f"{game_id}-icon.png"
+            fields["icon"] = native_icon if (library.COVER_DIR / native_icon).is_file() else ""
     fields["screenshots"] = [library.save_image(img, f"{game_id}-shot{i}.jpg", "shot") for i, img in enumerate(shots)]
     fields.update(
         description=meta.get("description", ""), developer=meta.get("developer", ""),
@@ -858,13 +921,17 @@ class Worker:
         self.lock = threading.Lock()
         self.pending = set()
 
-    def enqueue(self, ids):
+    def enqueue(self, ids, icons_only=False):
         with self.lock:
             for gid in ids:
                 if gid not in self.pending:
                     self.pending.add(gid)
                     game = library.get_game(gid) or {}
-                    self.queue.put((game.get("platform") != "PC", gid))
+                    self.queue.put((game.get("platform") != "PC", gid, icons_only))
+
+    def enqueue_icons(self):
+        if load_config().get("auto_scrape", True):
+            self.enqueue([g["id"] for g in library.list_games() if needs_site_icon(g)], icons_only=True)
 
     def busy(self):
         with self.lock:
@@ -872,12 +939,15 @@ class Worker:
 
     def loop(self):
         while True:
-            _, gid = self.queue.get()
+            _, gid, icons_only = self.queue.get()
             try:
                 online = bool(load_config().get("auto_scrape", True))
                 game = library.get_game(gid)
-                msg, _ = auto_scrape(gid, online=online)
-                if game:
+                if icons_only:
+                    msg = refresh_site_icon(gid) if online else ""
+                else:
+                    msg, _ = auto_scrape(gid, online=online)
+                if game and msg:
                     self.log(f"找资料：{game['name']} → {msg}")
             except Exception as e:
                 self.log(f"找资料出错（游戏 {gid}）：{e}")

@@ -21,6 +21,7 @@ import argparse
 import hashlib
 import hmac
 import json
+import msvcrt
 import os
 import re
 import shutil
@@ -30,6 +31,7 @@ import sys
 import time
 import zipfile
 import zlib
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 
@@ -38,6 +40,8 @@ CONFIG_PATH = ROOT / "config.json"
 STATE_PATH = ROOT / "data" / "extract_state.json"
 LOG_DIR = ROOT / "logs"
 WORK_DIR = ROOT / "data"  # 解压时的中转文件夹都放在这里
+SCAN_LOCK = ROOT / "data" / "extract.lock"
+EVENT_PREFIX = "__EXTRACT_EVENT__"
 
 DEFAULT_CONFIG = {
     "watch_dirs": ["games"],
@@ -733,7 +737,7 @@ def concat_sfx(exe_path, vols, out_path):
                 shutil.copyfileobj(f, out, length=8 * 1024 * 1024)
 
 
-def process_sfx(seven, exe_path, vols, dest, passwords, cfg, depth, watch_roots):
+def process_sfx(seven, exe_path, vols, dest, passwords, cfg, depth, watch_roots, progress=None, handled=None):
     group = {"trigger": exe_path, "parts": [exe_path] + vols, "key": str(exe_path).lower()}
     log(f"发现自解压分卷：{exe_path.name}（共 {len(vols) + 1} 个文件）")
     WORK_DIR.mkdir(exist_ok=True)
@@ -745,18 +749,24 @@ def process_sfx(seven, exe_path, vols, dest, passwords, cfg, depth, watch_roots)
         pwd, _out, note = choose_password(seven, combined, passwords)
         if pwd is None and note not in ("无密码", "空压缩包"):
             log(f"  自解压分卷跳过：{note}（可把密码加到 config.json）")
+            if progress:
+                progress({"phase": "result", "file": exe_path.name, "path": str(exe_path), "ok": False, "message": note})
             return False
         staging = WORK_DIR / "_staging_sfx"
         rc, _ = extract_archive(seven, {"trigger": combined, "parts": [combined]}, pwd, staging)
         if rc not in (0, 1):
             log(f"  自解压分卷解压失败（退出码 {rc}）")
             shutil.rmtree(staging, ignore_errors=True)
+            if progress:
+                progress({"phase": "result", "file": exe_path.name, "path": str(exe_path), "ok": False, "message": f"解压失败（退出码 {rc}）"})
             return False
         target = organize(staging, dest, exe_path.stem, True)
         log(f"  已解压到：{target}")
         if cfg.get("delete_archive", True):
             delete_group_files(group)
-        process_nested(seven, dest, passwords, cfg, depth - 1, watch_roots)
+        if progress:
+            progress({"phase": "result", "file": exe_path.name, "path": str(exe_path), "ok": True, "message": "已解压"})
+        process_nested(seven, dest, passwords, cfg, depth - 1, watch_roots, progress, handled)
         return True
     finally:
         try:
@@ -778,22 +788,32 @@ def iter_archives_in(directory):
                 yield group
 
 
-def process_nested(seven, directory, passwords, cfg, depth, watch_roots):
+def process_nested(seven, directory, passwords, cfg, depth, watch_roots, progress=None, handled=None):
     if depth <= 0:
         return
+    handled = handled if handled is not None else set()
     for group in list(iter_archives_in(directory)):
+        if group["key"] in handled:
+            continue
+        handled.add(group["key"])
         trigger = group["trigger"]
         parent = trigger.parent
         log(f"发现嵌套压缩包：{trigger.name}")
+        if progress:
+            progress({"phase": "extracting", "file": trigger.name, "message": "正在解压里面的压缩包"})
         hints = collect_hints(parent, passwords)
         android_only = archive_is_android(seven, group, hints)
         if android_only and divert_android_archive(group, cfg, watch_roots):
+            if progress:
+                progress({"phase": "result", "file": trigger.name, "path": str(trigger), "ok": True, "message": "安卓版已按设置处理"})
             continue
         staging = WORK_DIR / "_staging_nested"
         ok, note = extract_to_staging(seven, group, hints, staging)
         if not ok:
             shutil.rmtree(staging, ignore_errors=True)
             log(f"  跳过嵌套包：{note} —— {trigger.name}")
+            if progress:
+                progress({"phase": "result", "file": trigger.name, "path": str(trigger), "ok": False, "message": note})
             continue
         out_dir = output_dir(parent, android_only, watch_roots, cfg)
         target = organize(staging, out_dir, clean_name(trigger), parent == directory or android_only)
@@ -802,7 +822,9 @@ def process_nested(seven, directory, passwords, cfg, depth, watch_roots):
             delete_group_files(group)
             if android_only:
                 prune_empty_parents(parent, watch_roots)
-        process_nested(seven, target if target.is_dir() else parent, passwords, cfg, depth - 1, watch_roots)
+        if progress:
+            progress({"phase": "result", "file": trigger.name, "path": str(trigger), "ok": True, "message": "已解压"})
+        process_nested(seven, target if target.is_dir() else parent, passwords, cfg, depth - 1, watch_roots, progress, handled)
 
 
 def rename_stripped(directory):
@@ -929,7 +951,7 @@ def remove_empty_dirs(directory):
 
 
 # ---------------------------------------------------------------- 主流程
-def process_group(seven, group, cfg, passwords, watch_roots, into=None):
+def process_group(seven, group, cfg, passwords, watch_roots, into=None, progress=None):
     """解压一组压缩包并整理好，返回 (成功没有, 说明)。
 
     into：解压进这个文件夹（游戏库手动导入用）。这时只装着安卓版的压缩包解到安卓文件夹，
@@ -965,15 +987,17 @@ def process_group(seven, group, cfg, passwords, watch_roots, into=None):
 
     all_pwds = collect_hints(dest, hints)
     depth = int(cfg.get("nested_depth", 3))
+    # 保留原压缩包时，递归扫描不能把刚处理过的包再解一遍。
+    handled = {group["key"]}
     while True:
         sfx_sets = find_sfx_sets(dest)
         if not sfx_sets:
             break
         for exe_path, vols in sfx_sets:
-            if not process_sfx(seven, exe_path, vols, dest, all_pwds, cfg, depth, watch_roots):
+            if not process_sfx(seven, exe_path, vols, dest, all_pwds, cfg, depth, watch_roots, progress, handled):
                 break
         break
-    process_nested(seven, dest, all_pwds, cfg, depth, watch_roots)
+    process_nested(seven, dest, all_pwds, cfg, depth, watch_roots, progress, handled)
     rename_stripped(dest)
     sweep_android(dest, watch_roots, cfg)
     remove_empty_dirs(dest)
@@ -982,7 +1006,61 @@ def process_group(seven, group, cfg, passwords, watch_roots, into=None):
     return True, note
 
 
+@contextmanager
+def scan_lock(wait=False, on_wait=None):
+    """刷新和独立监视共用一把文件锁，避免同时整理、删除同一个压缩包。"""
+    SCAN_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with open(SCAN_LOCK, "a+b") as handle:
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        announced = False
+        while True:
+            handle.seek(0)
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                break
+            except OSError:
+                if not wait:
+                    yield False
+                    return
+                if not announced and on_wait:
+                    on_wait()
+                    announced = True
+                time.sleep(0.25)
+        try:
+            yield True
+        finally:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
 def scan_once(cfg, seven, state, seen, cooldown, force=False):
+    with scan_lock() as acquired:
+        if not acquired:
+            log("已有解压任务在运行，本轮稍后再试")
+            return
+        state.update(load_state())
+        return _scan_once(cfg, seven, state, seen, cooldown, force)
+
+
+def _scan_once(cfg, seven, state, seen, cooldown, force=False, progress=None):
+    report = {"processed": 0, "succeeded": 0, "failed": 0, "waiting": 0}
+
+    def result(path, ok, message):
+        report["processed"] += 1
+        report["succeeded" if ok else "failed"] += 1
+        if progress:
+            progress({"phase": "result", "file": path.name, "ok": ok, "message": message})
+
+    def nested_progress(event):
+        if event["phase"] == "result":
+            if event["ok"]:
+                state[event["path"]] = True
+            result(Path(event["file"]), event["ok"], event["message"])
+        elif progress:
+            progress(event)
+
     watch_roots = []
     for w in cfg["watch_dirs"]:
         p = ROOT / w if not Path(w).is_absolute() else Path(w)
@@ -1010,8 +1088,12 @@ def scan_once(cfg, seven, state, seen, cooldown, force=False):
                     if force or group_ready({"key": str(path).lower(), "parts": [path]}, stable, seen):
                         try:
                             handle_android_file(path, watch_roots, cfg)
+                            result(path, True, "安卓版已按设置处理")
                         except OSError as e:
                             log(f"  安卓版处理失败：{fname}：{e}")
+                            result(path, False, str(e))
+                    else:
+                        report["waiting"] += 1
                     continue
                 group = archive_group(path)
                 if not group:
@@ -1021,13 +1103,18 @@ def scan_once(cfg, seven, state, seen, cooldown, force=False):
                 if time.time() - cooldown.get(group["key"], 0) < 120:
                     continue
                 if not force and not group_ready(group, stable, seen):
+                    report["waiting"] += 1
                     continue
                 found += 1
+                if progress:
+                    progress({"phase": "extracting", "file": path.name, "message": "正在解压"})
                 try:
-                    ok, _ = process_group(seven, group, cfg, cfg.get("passwords") or [], watch_roots)
+                    ok, note = process_group(seven, group, cfg, cfg.get("passwords") or [], watch_roots,
+                                             progress=nested_progress)
                 except Exception as e:  # noqa: BLE001 单个文件出错不影响其它
                     log(f"  处理异常：{path.name}：{e}")
-                    ok = False
+                    ok, note = False, str(e)
+                result(path, ok, "已解压" if ok else note)
                 if ok:
                     state[str(path)] = True
                 else:
@@ -1037,6 +1124,27 @@ def scan_once(cfg, seven, state, seen, cooldown, force=False):
     else:
         log(f"扫描完成，处理了 {found} 个压缩包")
     save_state({k: v for k, v in state.items() if Path(k).exists()})
+    return report
+
+
+def scan_for_library(seven):
+    """游戏库刷新：先确认文件大小稳定，再解压并向页面报告结果。"""
+    def progress(event):
+        print(EVENT_PREFIX + json.dumps(event, ensure_ascii=False), flush=True)
+
+    def waiting():
+        progress({"phase": "waiting", "message": "正在等自动解压完成"})
+
+    with scan_lock(wait=True, on_wait=waiting):
+        cfg = load_config()
+        progress({"phase": "checking", "message": "正在检查下载文件夹"})
+        state, seen, cooldown = load_state(), {}, {}
+        report = _scan_once(cfg, seven, state, seen, cooldown, progress=progress)
+        if report["waiting"]:
+            progress({"phase": "waiting", "message": "正在确认压缩包已下载完成"})
+            time.sleep(max(float(cfg.get("stable_seconds", 8)), 0))
+            report = _scan_once(load_config(), seven, state, seen, cooldown, progress=progress)
+        progress({"phase": "finished", **report})
 
 
 def load_state():
@@ -1082,6 +1190,7 @@ def main():
     parser.add_argument("--once", action="store_true", help="只扫描一次就退出")
     parser.add_argument("--file", help="只处理指定的压缩包")
     parser.add_argument("--dir", nargs="*", help="临时指定要监视的目录")
+    parser.add_argument("--events", action="store_true", help="向游戏库报告解压进度")
     args = parser.parse_args()
 
     cfg = load_config()
@@ -1100,11 +1209,18 @@ def main():
         if not group:
             log(f"不是可识别的压缩包（或不是分卷第一份）：{path}")
             sys.exit(1)
-        ok, _ = process_group(seven, group, cfg, cfg.get("passwords") or [], [path.parent.resolve()])
+        with scan_lock() as acquired:
+            if not acquired:
+                log("已有解压任务在运行，请等它完成后再试")
+                sys.exit(1)
+            ok, _ = process_group(seven, group, cfg, cfg.get("passwords") or [], [path.parent.resolve()])
         sys.exit(0 if ok else 1)
 
     if args.once:
-        scan_once(cfg, seven, load_state(), {}, {}, force=True)
+        if args.events:
+            scan_for_library(seven)
+        else:
+            scan_once(cfg, seven, load_state(), {}, {}, force=True)
         return
     try:
         watch_loop(cfg, seven, args.dir)
