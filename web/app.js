@@ -595,9 +595,12 @@ function toggleRow(key, title, hint, on) {
     </label>`;
 }
 
+let savedPasswords = [];
+
 function renderSettingsBody(s) {
   const body = $('#settings-body');
   if (!body) return;
+  savedPasswords = s.passwords;
   body.innerHTML = `
     <section class="card">
       <h3>皮肤</h3>
@@ -632,6 +635,19 @@ function renderSettingsBody(s) {
       <div class="inner">${toggleRow('delete_archive', '解压成功后删除压缩包', '关掉的话压缩包会留着，占双份空间。', s.delete_archive)}</div>
     </section>
     <section class="card">
+      <h3>解压密码 <span class="n">${s.passwords.length}</span></h3>
+      <div class="inner">
+        <p class="hint">自动解压和导入压缩包时，从上到下逐个试。导入时手动输对的密码也会自动记到这里。</p>
+        ${s.passwords.length ? `<ol class="pw-list">${s.passwords.map((p, i) => `
+          <li><code>${esc(p)}</code><button class="icon-btn" data-pw-remove="${i}" title="删除这个密码" aria-label="删除这个密码">${ICONS.trash}</button></li>`).join('')}
+        </ol>` : '<p class="muted">还没有密码。下载页面上写的解压密码，可以加在这里。</p>'}
+        <form id="pw-form" class="pw-add field">
+          <input type="text" id="pw-input" placeholder="输入解压密码，回车添加" autocomplete="off" spellcheck="false">
+          <button class="btn">${ICONS.plus}添加</button>
+        </form>
+      </div>
+    </section>
+    <section class="card">
       <h3>游戏资料</h3>
       <div class="inner">${toggleRow('auto_scrape', '新游戏自动联网找资料', '会把游戏名发给 Steam、VNDB、DLsite 和 itch.io 搜索。关掉后只从游戏文件里取，联网要在游戏页面手动点「匹配资料」。', s.auto_scrape)}</div>
     </section>
@@ -645,6 +661,27 @@ async function saveSettings(changes) {
   } catch (e) {
     toast(e.message, true);
     renderSettings();
+  }
+}
+
+async function addPassword(input) {
+  const password = input.value.trim();
+  if (!password) return input.focus();
+  try {
+    renderSettingsBody(await api('POST', '/api/passwords', { password }));
+    toast('密码已添加');
+    $('#pw-input').focus();
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+async function removePassword(i) {
+  try {
+    renderSettingsBody(await api('POST', '/api/passwords/remove', { password: savedPasswords[i] }));
+    toast('密码已删除');
+  } catch (e) {
+    toast(e.message, true);
   }
 }
 
@@ -1241,6 +1278,7 @@ view.addEventListener('click', async e => {
   if (t.hasAttribute('data-back')) return history.length > 1 ? history.back() : (location.hash = '#/');
   if (t.dataset.status) return setStatus(id, t.dataset.status);
   if (t.hasAttribute('data-open-android')) return api('POST', '/api/open-android-dir').catch(err => toast(err.message, true));
+  if (t.dataset.pwRemove) return removePassword(+t.dataset.pwRemove);
   if (t.dataset.rate) {
     const n = +t.dataset.rate === game(id).rating ? 0 : +t.dataset.rate;
     view.querySelectorAll('[data-rate]').forEach(b => b.classList.toggle('on', +b.dataset.rate <= n));
@@ -1309,6 +1347,12 @@ view.addEventListener('change', async e => {
 
 view.addEventListener('keydown', e => {
   if (e.key === 'Enter' && e.target.matches('input[data-field]')) e.target.blur();
+});
+
+view.addEventListener('submit', e => {
+  if (e.target.id !== 'pw-form') return;
+  e.preventDefault();
+  addPassword($('#pw-input'));
 });
 
 $('#image-file').addEventListener('change', e => {

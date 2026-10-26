@@ -1067,7 +1067,12 @@ def watch_loop(cfg, seven, watch_dirs=None):
         scan_once(cfg, seven, state, seen, cooldown)
         time.sleep(float(cfg.get("poll_seconds", 10)))
         # 每轮重新读设置，在游戏库「设置」里改了马上生效
+        old_passwords = set(cfg.get("passwords") or [])
         cfg = load_config()
+        # 密码都不对的压缩包要冷却两分钟再试；加了新密码就不用等，下一轮马上重试
+        if set(cfg.get("passwords") or []) - old_passwords and cooldown:
+            log("加了新密码，马上重试之前没解开的压缩包")
+            cooldown.clear()
         if watch_dirs:
             cfg["watch_dirs"] = watch_dirs
 

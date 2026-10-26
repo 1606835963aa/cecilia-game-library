@@ -267,6 +267,11 @@
 [data-theme="paper"] .check input { accent-color: var(--leaf); }
 [data-theme="paper"] .switch { background: #d3ddcf; }
 [data-theme="paper"] .switch:checked { background: var(--leaf); }
+[data-theme="paper"] .pw-list { background: #fffdf7; }
+[data-theme="paper"] .pw-list code { color: var(--ink); }
+[data-theme="paper"] .pw-list li::before { color: var(--sage); }
+[data-theme="paper"] .pw-list .icon-btn { background: none; box-shadow: none; }
+[data-theme="paper"] .pw-list .icon-btn:hover { background: #f7e3e5; color: var(--rose-ink); }
 [data-theme="paper"] .skin:has(input:checked) .skin-preview { box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--sage); }
 
 /* ---------- 右键菜单 ---------- */

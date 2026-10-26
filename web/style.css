@@ -456,6 +456,16 @@ select:focus-visible { box-shadow: 0 0 0 1px var(--blue-soft); outline: 0; }
 .setting-row .btn { flex: none; }
 .setting-text { flex: 1; min-width: 0; display: grid; gap: 2px; }
 .setting-text .path { word-break: break-all; }
+.pw-list { list-style: none; margin: 0; padding: 0; border-radius: var(--r-sm); box-shadow: inset 0 0 0 1px var(--line); counter-reset: pw; }
+.pw-list li { display: flex; align-items: center; gap: 12px; padding: 4px 6px 4px 12px; counter-increment: pw; }
+.pw-list li + li { border-top: 1px solid var(--line); }
+.pw-list li::before { content: counter(pw); width: 18px; color: var(--text-4); font-size: 12px; font-variant-numeric: tabular-nums; }
+.pw-list code { flex: 1; min-width: 0; color: var(--text); font: 13px/1.6 Consolas, "Cascadia Mono", monospace; word-break: break-all; user-select: all; }
+.pw-list .icon-btn { width: 30px; height: 30px; background: none; }
+.pw-list .icon-btn svg { width: 15px; height: 15px; }
+.pw-list .icon-btn:hover { color: var(--danger); }
+.pw-add { display: flex; gap: 8px; }
+.pw-add .btn { flex: none; }
 .choices { display: grid; gap: 8px; }
 .choice {
   display: flex; align-items: flex-start; gap: 12px; padding: 12px 14px; border-radius: var(--r);

@@ -464,6 +464,7 @@ def api_settings():
         "delete_archive": bool(cfg.get("delete_archive", True)),
         "theme": current_theme(),
         "themes": {k: v["label"] for k, v in THEMES.items()},
+        "passwords": [str(p) for p in cfg.get("passwords") or []],
     }
 
 
@@ -485,6 +486,33 @@ async def api_save_settings(request: Request):
         raise HTTPException(400, f"设置没存上：{e}")
     if "theme" in updates:
         shell.paint_title_bar()
+    return api_settings()
+
+
+# 解压密码：每次都在当下的设置文件上加减一个，不整份覆盖，免得冲掉导入时刚记下的密码
+@app.post("/api/passwords")
+async def api_add_password(request: Request):
+    pwd = str((await request.json()).get("password", "")).strip()
+    if not pwd:
+        raise HTTPException(400, "密码是空的")
+    saved = [str(p) for p in load_config().get("passwords") or []]
+    if pwd in saved:
+        raise HTTPException(400, "这个密码已经在列表里了")
+    try:
+        save_config({"passwords": saved + [pwd]})
+    except (OSError, ValueError) as e:
+        raise HTTPException(400, f"密码没存上：{e}")
+    return api_settings()
+
+
+@app.post("/api/passwords/remove")
+async def api_remove_password(request: Request):
+    pwd = str((await request.json()).get("password", ""))
+    saved = [str(p) for p in load_config().get("passwords") or []]
+    try:
+        save_config({"passwords": [p for p in saved if p != pwd]})
+    except (OSError, ValueError) as e:
+        raise HTTPException(400, f"密码没删掉：{e}")
     return api_settings()
 
 
