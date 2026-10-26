@@ -54,6 +54,31 @@
 </tr>
 </table>
 
+## 📸 界面
+
+<table>
+<tr>
+<td width="50%" valign="top">
+<img src="docs/screenshots/home-steam.webp" alt="主页（经典深色）"><br>
+<p align="center">主页：继续游戏、最近游戏和封面墙</p>
+</td>
+<td width="50%" valign="top">
+<img src="docs/screenshots/game-steam.webp" alt="游戏页面（经典深色）"><br>
+<p align="center">游戏页面：一键启动、游玩统计、简介和截图</p>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<img src="docs/screenshots/home-paper.webp" alt="主页（浪子的真情）"><br>
+<p align="center">「浪子的真情」皮肤</p>
+</td>
+<td width="50%" valign="top">
+<img src="docs/screenshots/wishlist-paper.webp" alt="愿望单和版本对比"><br>
+<p align="center">愿望单：记下加入时的版本，发现新版会提示</p>
+</td>
+</tr>
+</table>
+
 ## 🔄 工作流程
 
 ```mermaid
@@ -402,7 +427,7 @@ icacls "游戏文件夹" /setintegritylevel M /T /C /Q
 | `itch_account.py` | itch.io 官网登录窗口、成人内容设置检测、登录后的搜索和退出清理 |
 | `wishlist.py` | 愿望单、加入时版本、官网版本历史和本地游戏关联 |
 | `web\` | 游戏库的页面（HTML / CSS / JS） |
-| `docs\` | 说明文档用的图片 |
+| `docs\` | 说明文档用的图片和界面截图 |
 | `AGENTS.md` | 给 AI 编程助手看的项目说明 |
 | `*.bat` | 双击用的启动脚本 |
 | `config.json` | 设置文件（两部分共用，不进版本库） |
