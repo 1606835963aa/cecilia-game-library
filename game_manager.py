@@ -183,13 +183,20 @@ async def guard(request: Request, call_next):
         return PlainTextResponse("forbidden", status_code=403)
     if request.url.path.startswith("/api/") and request.headers.get("x-token") != TOKEN:
         return PlainTextResponse("forbidden", status_code=403)
-    return await call_next(request)
+    response = await call_next(request)
+    # 页面文件每次都先问一下有没有更新，不然窗口会一直用缓存里的旧版页面
+    if request.url.path == "/" or request.url.path.startswith("/web/"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
 
 
 @app.get("/", response_class=HTMLResponse)
 def index():
     html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
     html = html.replace("__TOKEN__", TOKEN).replace("__THEME__", current_theme())
+    # 页面文件的地址带上最后修改时间，文件一改地址就变，窗口不会拿缓存里的旧版
+    version = max(int(f.stat().st_mtime) for f in WEB_DIR.iterdir() if f.is_file())
+    html = html.replace("__VERSION__", str(version))
     # 软件窗口里标题栏是页面自己画的；用浏览器打开时没有这些按钮
     return html.replace("__FRAME__", "custom" if shell.window else "")
 
