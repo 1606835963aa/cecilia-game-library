@@ -376,6 +376,7 @@ icacls "游戏文件夹" /setintegritylevel M /T /C /Q
 | `scraper.py` | 找游戏资料：从游戏文件、Steam、VNDB、DLsite、itch.io 找真名、封面、背景、简介和截图 |
 | `web\` | 游戏库的页面（HTML / CSS / JS） |
 | `docs\` | 说明文档用的图片 |
+| `AGENTS.md` | 给 AI 编程助手看的项目说明 |
 | `*.bat` | 双击用的启动脚本 |
 | `config.json` | 设置文件（两部分共用，不进版本库） |
 
