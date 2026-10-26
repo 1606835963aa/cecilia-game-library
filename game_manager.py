@@ -22,7 +22,8 @@ import webbrowser
 from datetime import datetime
 from pathlib import Path
 
-LOG_FILE = Path(__file__).resolve().parent / "logs" / "game_manager.log"
+# 打包成 exe 时日志放在 exe 旁边（和 auto_extract.ROOT 同一个位置，这里要赶在加载其他模块前用到）
+LOG_FILE = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent / "logs" / "game_manager.log"
 
 # pythonw 没有控制台，把输出（包括报错）都写进日志文件。
 # 要赶在 pywebview 加载之前做，它发现没有控制台会把输出扔掉。
@@ -56,14 +57,14 @@ import scraper
 import wishlist
 from itch_account import ItchAccount
 from window_frame import CustomFrame
-from auto_extract import (ANDROID_MODES, EVENT_PREFIX, ROOT, android_root, download_roots, find_seven_zip,
-                          games_root, load_config, save_config, scan_lock, validate_layout)
+from auto_extract import (ANDROID_MODES, APP_DIR, EVENT_PREFIX, FROZEN, ROOT, android_root, download_roots,
+                          find_seven_zip, games_root, load_config, save_config, scan_lock, validate_layout)
 
-WEB_DIR = ROOT / "web"
+WEB_DIR = APP_DIR / "web"
 ICON = WEB_DIR / "icon.ico"
 WINDOW_STATE = ROOT / "data" / "window.json"
 WEBVIEW_DATA = ROOT / "data" / "webview"
-PORT = 8765
+PORT = int(os.environ.get("GAME_LIBRARY_PORT") or 8765)  # 开发时换个端口，就能和正在用的游戏库同时开
 APP_ID = "game-library"
 TOKEN = secrets.token_hex(16)
 AUTO_SCAN_SECONDS = 60
@@ -214,11 +215,15 @@ class RefreshRunner:
 
     def run(self):
         try:
-            # pythonw 没有标准输出，改用同一套 Python 的控制台入口并隐藏黑窗口，才能读取进度。
-            python = Path(sys.executable)
-            if python.name.lower() == "pythonw.exe":
-                python = python.with_name("python.exe")
-            command = [str(python), "-u", "-X", "utf8", str(ROOT / "auto_extract.py"), "--once", "--events"]
+            # 游戏库窗口没有标准输出，改用控制台程序跑解压并隐藏黑窗口，才能读取进度。
+            # 打包成 exe 时用旁边的「自动解压.exe」，源码运行时用同一套 Python 的 python.exe。
+            if FROZEN:
+                command = [str(ROOT / "自动解压.exe"), "--once", "--events"]
+            else:
+                python = Path(sys.executable)
+                if python.name.lower() == "pythonw.exe":
+                    python = python.with_name("python.exe")
+                command = [str(python), "-u", "-X", "utf8", str(ROOT / "auto_extract.py"), "--once", "--events"]
             report = None
             with subprocess.Popen(command, cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                   stderr=subprocess.STDOUT, encoding="utf-8", errors="replace",

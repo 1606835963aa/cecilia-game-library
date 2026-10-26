@@ -37,6 +37,7 @@
 | `web/theme-paper.css` | 皮肤「浪子的真情」（`paper`），全部写在 `[data-theme="paper"]` 下，覆盖变量和少量组件样式 |
 | `web/icon.ico` | 软件图标：窗口、任务栏、favicon、经典深色皮肤左上角 |
 | `docs/` | README 用的图片 |
+| `packaging/` | 绿色版打包：`cecilia.spec`（PyInstaller 配置，两个 exe 共用 `_internal`）和 `build.py`（打包、带上 7-Zip、压成 zip） |
 
 模块依赖方向：`auto_extract` ← `library` ← `scraper` / `importer` ← `game_manager`。`auto_extract.py` 不能反过来 import 其他模块，它要能单独运行。
 
@@ -56,6 +57,12 @@ python auto_extract.py --once
 
 扫一遍就退出。`--file <路径>` 只处理一个文件，`--dir <路径>` 临时换监视目录。
 
+```bash
+python packaging/build.py
+```
+
+打包绿色版，需要 PyInstaller 和装在默认位置的 7-Zip。结果在 `dist/塞西莉亚的游戏库/`（`塞西莉亚的游戏库.exe` 打开游戏库，`自动解压.exe` 常驻监视，`7-Zip/` 是自带的 7-Zip）和 `dist/塞西莉亚的游戏库-绿色版.zip`。`dist/` 不进版本库。
+
 游戏库是单实例：端口 8765 上已经有游戏库时，新进程只调 `/show` 把旧窗口叫到前台就退出。改了 Python 代码要先完全关掉旧的游戏库进程（窗口藏起来时进程还在），否则看到的还是旧版。
 
 ## 验证改动
@@ -65,6 +72,8 @@ python auto_extract.py --once
 - **接口**：用 `fastapi.testclient.TestClient(game_manager.app)`，请求要带 `Host: 127.0.0.1` 和 `X-Token: game_manager.TOKEN` 头。
 - **页面**：`--browser` 模式开起来，用 Playwright 之类的工具截图，两套皮肤都要看（设置页切换，或改 `config.json` 的 `theme`）。
 - **解压**：用 7-Zip 现做带密码的测试压缩包。
+- **和正在用的游戏库同时开**：设环境变量 `GAME_LIBRARY_PORT` 换个端口，否则新开的游戏库会认为已经有一个在运行，只把旧窗口叫到前台就退出。
+- **绿色版**：把 `dist/塞西莉亚的游戏库` 复制到 `tmp/` 下，放好 `config.json` 和测试压缩包再运行两个 exe，数据都写在复制出来的文件夹里。
 - **隔离**：`ROOT` 取的是脚本所在文件夹，把项目复制到 `tmp/` 下的沙盒里跑，就有独立的 `config.json`、`games/`、`data/`，不会碰用户的真实数据和密码。
 - 临时文件放项目里的 `tmp/`（已在 `.gitignore`），用完删掉。
 
@@ -74,6 +83,7 @@ python auto_extract.py --once
 - **页面缓存**：`/` 和 `/web/*` 都返回 `Cache-Control: no-cache`，静态文件地址带 `?v=<web 文件最新修改时间>`。新加的 CSS / JS 文件也要在 `index.html` 里带 `?v=__VERSION__`。
 - **WebView2 线程**：碰 `window.native` 下的 WebView2 对象必须走 `Shell.on_ui_thread`，在别的线程直接读写会让两边卡死。
 - **itch.io 登录**：官网窗口不挂本机 `js_api`；登录信息不进设置接口、日志或 `config.json`。搜索通过官网窗口内同源请求执行，公开作品详情仍用普通 HTTP 请求。退出只清理 itch.io 的 Cookie，不清理游戏库页面数据；关主窗口时要销毁隐藏的官网窗口。
+- **打包成 exe**：`auto_extract.ROOT` 是可写的数据位置（源码运行时是项目文件夹，打包后是 exe 所在文件夹），`APP_DIR` 是程序自带文件的位置（打包后是 `_internal`）。设置、数据、游戏用 `ROOT`，页面这类随程序发布的文件用 `APP_DIR`。打包后「刷新」调用旁边的 `自动解压.exe`，源码运行时调用 `python.exe auto_extract.py`。新加的随程序发布的文件要写进 `cecilia.spec` 的 `datas`；按名字动态加载的模块要写进 `hiddenimports`。
 - **拖放导入**：完整文件路径只有 Python 这边拿得到（`Shell.on_drop` 里的 `pywebviewFullPath`），再通过 `window.importDropped(...)` 交给页面。
 - **改设置**：`save_config(updates)` 只合并给出的键。密码列表的增删接口（`/api/passwords`、`/api/passwords/remove`）每次在当下的文件上加减一个，不整份覆盖，因为导入线程也会往里写密码。
 - **目录分工**：`download_dirs` 是待解压来源，`games_dir` 是 PC 成品目录，`watch_dirs` 是额外的游戏扫描目录。下载目录不能与 PC、安卓成品目录重叠。完整解压和套娃检查在中转目录完成，内层失败保留来源原包。`publish_game` 去掉单一包装层并原子放进 `Game_编号`，`.game-library.json` 保存原名供入库和资料匹配。
@@ -92,7 +102,7 @@ python auto_extract.py --once
 - 示例、注释、文档里的游戏名、作品编号、网站名都用中性的虚构例子（比如 `SummerMemories`），不写真实作品。
 - 注释和文档只描述代码现在的样子，不写修改历史、不写开发阶段的字眼。
 - 代码注释用中文，说明「为什么这样做」，密度和现有代码保持一致。
-- 改了用户能感知到的行为（设置项、界面、解压规则、配置项），同步改 README 对应的段落。
+- README 面向普通用户，只写这是什么、怎么下载、怎么用和常见问题，不写实现细节、配置项和文件结构；用户能感知到的用法变了，同步改 README 对应的段落。全部配置项和默认值见 `auto_extract.DEFAULT_CONFIG`。
 - 仓库现在是私有的，不要改仓库的公开状态。
 
 ## 和用户协作

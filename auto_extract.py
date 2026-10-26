@@ -37,7 +37,10 @@ from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from uuid import uuid4
 
-ROOT = Path(__file__).resolve().parent
+# 打包成 exe 时，设置、数据和游戏放在 exe 旁边；页面这类程序自带的文件在 PyInstaller 的 _internal 里
+FROZEN = getattr(sys, "frozen", False)
+ROOT = Path(sys.executable if FROZEN else __file__).resolve().parent
+APP_DIR = Path(getattr(sys, "_MEIPASS", ROOT))
 CONFIG_PATH = ROOT / "config.json"
 STATE_PATH = ROOT / "data" / "extract_state.json"
 LOG_DIR = ROOT / "logs"
@@ -72,6 +75,7 @@ ANDROID_EXT = (".apk", ".xapk", ".apks", ".obb")
 DOC_EXT = (".txt", ".url", ".htm", ".html", ".md", ".ini", ".pdf", ".jpg", ".jpeg", ".png", ".gif", ".webp")
 
 SEVEN_ZIP_CANDIDATES = [
+    str(ROOT / "7-Zip" / "7z.exe"),  # 绿色版自带的 7-Zip
     r"C:\Program Files\7-Zip\7z.exe",
     r"C:\Program Files (x86)\7-Zip\7z.exe",
 ]
@@ -1344,6 +1348,10 @@ def main():
     parser.add_argument("--dir", nargs="*", help="临时指定要监视的目录")
     parser.add_argument("--events", action="store_true", help="向游戏库报告解压进度")
     args = parser.parse_args()
+    if args.events:
+        # 游戏库按 UTF-8 读进度；打包成 exe 后没有 python -X utf8 可用，在这里指定
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
 
     cfg = load_config()
     if args.dir:

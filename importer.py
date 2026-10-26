@@ -31,7 +31,7 @@ FIND_DEPTH = 3       # 拖进来的文件夹不是游戏时，往里找几层
 MAX_ITEMS = 200
 KEEP_JOBS = 60       # 界面上留着的导入记录条数
 COPY_CHUNK = 8 * 1024 * 1024
-PROGRAM_DIRS = ("web", "data", "logs", ".git", "__pycache__")  # 游戏库程序自己的文件夹，不能导入
+PROGRAM_DIRS = ("web", "data", "logs", ".git", "__pycache__", "_internal", "7-Zip")  # 游戏库程序自己的文件夹，不能导入
 
 
 def games_root():
