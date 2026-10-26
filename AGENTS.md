@@ -61,7 +61,7 @@ python auto_extract.py --once
 python packaging/build.py
 ```
 
-打包绿色版，需要 PyInstaller 和装在默认位置的 7-Zip。结果在 `dist/塞西莉亚的游戏库/`（`塞西莉亚的游戏库.exe` 打开游戏库，`自动解压.exe` 常驻监视，`7-Zip/` 是自带的 7-Zip）和 `dist/塞西莉亚的游戏库-绿色版.zip`。`dist/` 不进版本库。
+打包绿色版，需要 PyInstaller 和装在默认位置的 7-Zip。结果在 `dist/塞西莉亚的游戏库/`（`塞西莉亚的游戏库.exe` 打开游戏库，`自动解压.exe` 常驻监视，`7-Zip/` 是自带的 7-Zip）和 `dist/CeciliaGameLibrary-portable.zip`（压缩包里的文件夹和 exe 仍是中文名）。`dist/` 不进版本库。发布时把这个 zip 传到 GitHub Releases。
 
 游戏库是单实例：端口 8765 上已经有游戏库时，新进程只调 `/show` 把旧窗口叫到前台就退出。改了 Python 代码要先完全关掉旧的游戏库进程（窗口藏起来时进程还在），否则看到的还是旧版。
 

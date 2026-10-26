@@ -82,7 +82,7 @@
 
 ## 📥 下载
 
-1. 到 [Releases 页面](https://github.com/1606835963aa/cecilia-game-library/releases) 下载最新的 `塞西莉亚的游戏库-绿色版.zip`。
+1. 到 [Releases 页面](https://github.com/1606835963aa/cecilia-game-library/releases) 下载最新版本里的 `CeciliaGameLibrary-portable.zip`（绿色版）。
 2. 解压到一个空间够大的地方，比如 `D:\塞西莉亚的游戏库`。以后下载的压缩包和解压好的游戏都放在这个文件夹里。
 3. 双击里面的 `塞西莉亚的游戏库.exe` 就能用了。
 

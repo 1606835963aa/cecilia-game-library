@@ -3,7 +3,7 @@
     python packaging\\build.py
 
 需要先装 PyInstaller（pip install pyinstaller）和 7-Zip。
-结果在 dist\\塞西莉亚的游戏库（文件夹）和 dist\\塞西莉亚的游戏库-绿色版.zip。
+结果在 dist\\塞西莉亚的游戏库（文件夹）和 dist\\CeciliaGameLibrary-portable.zip。
 """
 import shutil
 import subprocess
@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 NAME = "塞西莉亚的游戏库"
 DIST = ROOT / "dist"
 APP = DIST / NAME
-ZIP = DIST / f"{NAME}-绿色版.zip"
+ZIP = DIST / "CeciliaGameLibrary-portable.zip"  # GitHub 发布页会把中文文件名改成「-.zip」，zip 名用英文
 WORK = ROOT / "tmp" / "pyinstaller"
 SEVEN_ZIP = Path(r"C:\Program Files\7-Zip")
 # 7-Zip 命令行解压只需要这两个文件；按 7-Zip 的许可证要求带上许可证原文
