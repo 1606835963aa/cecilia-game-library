@@ -60,6 +60,7 @@ DEFAULT_CONFIG = {
     "scan_depth": 6,
     "nested_depth": 3,
     "auto_scrape": True,
+    "auto_update": True,
     "android": "keep",
     "android_dir": "android",
     "theme": "steam",
@@ -138,6 +139,15 @@ def save_config(updates):
         user = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
     user.update(updates)
     CONFIG_PATH.write_text(json.dumps(user, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def software_update_pending():
+    """更新时让常驻解压在两轮之间退出，释放程序文件；过期请求不会一直阻止解压。"""
+    try:
+        request = json.loads((ROOT / "tmp/updates/active.json").read_text(encoding="utf-8"))
+        return time.time() < float(request["expires"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
 
 
 def resolve_dir(value):
@@ -1218,6 +1228,8 @@ def scan_once(cfg, seven, state, seen, cooldown, force=False):
         if not acquired:
             log("已有解压任务在运行，本轮稍后再试")
             return
+        if software_update_pending():
+            return
         state.update(load_state())
         return _scan_once(cfg, seven, state, seen, cooldown, force)
 
@@ -1354,6 +1366,9 @@ def watch_loop(cfg, seven, watch_dirs=None):
     log(f"游戏目录：{games_root(cfg)}")
     log(f"安卓版：{ANDROID_MODES.get(cfg.get('android'), cfg.get('android'))}（安卓文件夹：{android_root(cfg)}）")
     while True:
+        if software_update_pending():
+            log("游戏库正在更新，自动解压稍后重新打开")
+            return
         scan_once(cfg, seven, state, seen, cooldown)
         time.sleep(float(cfg.get("poll_seconds", 10)))
         # 每轮重新读设置，在游戏库「设置」里改了马上生效
@@ -1374,6 +1389,9 @@ def main():
     parser.add_argument("--dir", nargs="*", help="临时指定要监视的目录")
     parser.add_argument("--events", action="store_true", help="向游戏库报告解压进度")
     args = parser.parse_args()
+    if software_update_pending():
+        log("游戏库正在更新，请等更新完成后再打开")
+        return
     if args.events:
         # 游戏库按 UTF-8 读进度；打包成 exe 后没有 python -X utf8 可用，在这里指定
         sys.stdout.reconfigure(encoding="utf-8")

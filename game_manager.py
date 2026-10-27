@@ -55,6 +55,9 @@ import importer
 import library
 import scraper
 import wishlist
+import updates
+from app_version import VERSION
+from update_helper import active_request
 from itch_account import ItchAccount
 from window_frame import CustomFrame
 from auto_extract import (ANDROID_MODES, APP_DIR, EVENT_PREFIX, FROZEN, ROOT, android_root, download_roots,
@@ -68,6 +71,9 @@ PORT = int(os.environ.get("GAME_LIBRARY_PORT") or 8765)  # 开发时换个端口
 APP_ID = "game-library"
 TOKEN = secrets.token_hex(16)
 AUTO_SCAN_SECONDS = 60
+maintenance_lock = threading.Lock()
+maintenance = {"updating": False, "writes": 0, "scans": 0}
+exit_requested = threading.Event()
 # 皮肤：页面配色在 web 里，这里管窗口标题栏和页面出来之前的底色，都和页面顶部导航条同色
 THEMES = {
     "steam": {"label": "经典深色", "dark": True, "bar": "#171a21", "text": "#dcdedf", "bg": "#1a1f26"},
@@ -281,7 +287,18 @@ async def guard(request: Request, call_next):
         return PlainTextResponse("forbidden", status_code=403)
     if request.url.path.startswith("/api/") and request.headers.get("x-token") != TOKEN:
         return PlainTextResponse("forbidden", status_code=403)
-    response = await call_next(request)
+    writing = request.url.path.startswith("/api/") and request.method not in ("GET", "HEAD", "OPTIONS")
+    with maintenance_lock:
+        if writing and maintenance["updating"]:
+            return JSONResponse({"error": "正在更新软件，请稍等片刻"}, status_code=503)
+        if writing:
+            maintenance["writes"] += 1
+    try:
+        response = await call_next(request)
+    finally:
+        if writing:
+            with maintenance_lock:
+                maintenance["writes"] -= 1
     # 页面文件每次都先问一下有没有更新，不然窗口会一直用缓存里的旧版页面
     if request.url.path == "/" or request.url.path.startswith("/web/"):
         response.headers["Cache-Control"] = "no-cache"
@@ -301,7 +318,7 @@ def index():
 
 @app.get("/healthz")
 def healthz():
-    return {"app": APP_ID}
+    return {"app": APP_ID, "version": VERSION}
 
 
 @app.post("/show")
@@ -350,15 +367,23 @@ def api_games():
 
 
 def scan_and_queue(full=False):
-    result = library.scan(full=full)
-    if result["added"]:
-        log(f"新入库：{'、'.join(result['added'])}")
-        worker.enqueue(result["added_ids"])
-    if full:
-        worker.enqueue_unmatched()
-        worker.enqueue_versions()
-        worker.enqueue_icons()
-    return result
+    with maintenance_lock:
+        if maintenance["updating"]:
+            return {"added": [], "added_ids": [], "total": len(library.list_games())}
+        maintenance["scans"] += 1
+    try:
+        result = library.scan(full=full)
+        if result["added"]:
+            log(f"新入库：{'、'.join(result['added'])}")
+            worker.enqueue(result["added_ids"])
+        if full:
+            worker.enqueue_unmatched()
+            worker.enqueue_versions()
+            worker.enqueue_icons()
+        return result
+    finally:
+        with maintenance_lock:
+            maintenance["scans"] -= 1
 
 
 @app.post("/api/scan")
@@ -640,6 +665,8 @@ def api_settings():
         "android_modes": ANDROID_MODES,
         "android_dir": str(android_root(cfg)),
         "auto_scrape": bool(cfg.get("auto_scrape", True)),
+        "auto_update": bool(cfg.get("auto_update", True)),
+        "software_update": software_updates.snapshot(),
         "delete_archive": bool(cfg.get("delete_archive", True)),
         "download_dirs": [str(p) for p in download_roots(cfg)],
         "games_dir": str(games_root(cfg)),
@@ -654,7 +681,7 @@ def api_settings():
 @app.patch("/api/settings")
 async def api_save_settings(request: Request):
     body = await request.json()
-    updates = {k: bool(body[k]) for k in ("auto_scrape", "delete_archive") if k in body}
+    updates = {k: bool(body[k]) for k in ("auto_scrape", "delete_archive", "auto_update") if k in body}
     if "android" in body:
         if body["android"] not in ANDROID_MODES:
             raise HTTPException(400, "不认识的安卓版处理方式")
@@ -807,6 +834,31 @@ async def http_error(request, exc):
 
 
 # ---------------------------------------------------------------- 后台扫描
+@app.get("/api/updates")
+def api_updates():
+    return software_updates.snapshot()
+
+
+@app.post("/api/updates/check")
+def api_update_check():
+    return software_updates.check()
+
+
+@app.post("/api/updates/install")
+def api_update_install():
+    try:
+        return software_updates.install()
+    except ValueError as error:
+        raise HTTPException(400, str(error))
+
+
+@app.post("/api/updates/activity")
+async def api_update_activity(request: Request):
+    body = await request.json()
+    software_updates.activity(editing=bool(body.get("editing")))
+    return {"ok": True}
+
+
 def auto_scan_loop():
     while True:
         time.sleep(AUTO_SCAN_SECONDS)
@@ -859,8 +911,9 @@ class Shell:
         self.itch = ItchAccount(self, self.on_itch_ready, log)
 
     def on_itch_ready(self):
-        if load_config().get("auto_scrape", True):
-            worker.enqueue(library.unmatched_games())
+        with maintenance_lock:
+            if not maintenance["updating"] and load_config().get("auto_scrape", True):
+                worker.enqueue(library.unmatched_games())
 
     def run(self, url):
         try:
@@ -988,6 +1041,58 @@ class Shell:
 shell = Shell()
 
 
+def prepare_software_update():
+    with maintenance_lock:
+        if maintenance["writes"] or maintenance["scans"]:
+            return "等当前操作完成后更新"
+        if tracker.active():
+            return "等游戏结束后更新"
+        if imports.busy() or refresh.busy():
+            return "等导入和解压完成后更新"
+        if worker.busy() or shell.itch.visible or shell.itch.snapshot().get("checking"):
+            return "等资料获取和官网窗口关闭后更新"
+        with scan_lock() as acquired:
+            if not acquired:
+                return "等解压完成后更新"
+        maintenance["updating"] = True
+    return ""
+
+
+def release_software_update():
+    with maintenance_lock:
+        maintenance["updating"] = False
+
+
+def close_for_update():
+    if shell.window:
+        shell.window.destroy()
+    exit_requested.set()
+
+
+software_updates = updates.UpdateManager(ROOT, FROZEN, load_config, prepare_software_update,
+                                         close_for_update, release_software_update, log)
+
+
+def start_background(browser=False, update_job=None):
+    if update_job:
+        if not browser and not shell.ready.wait(60):
+            return
+        updates.acknowledge_boot(ROOT, update_job)
+        while active_request(ROOT):
+            time.sleep(0.2)
+        software_updates.update(phase="done", message=f"已更新到 {VERSION}")
+        release_software_update()
+        scan_and_queue()
+    threading.Thread(target=tracker.loop, daemon=True).start()
+    threading.Thread(target=auto_scan_loop, daemon=True).start()
+    threading.Thread(target=worker.loop, daemon=True).start()
+    imports.cleanup()
+    threading.Thread(target=imports.loop, daemon=True).start()
+    worker.enqueue(library.unprocessed_games())
+    worker.enqueue_icons()
+    software_updates.start(browser)
+
+
 def show_existing():
     """游戏库已经开着时，让它把窗口叫到前台。"""
     ctypes.windll.user32.AllowSetForegroundWindow(-1)  # 允许那个进程把自己的窗口放到最前面
@@ -998,7 +1103,19 @@ def show_existing():
 def main():
     parser = argparse.ArgumentParser(description="本地游戏库")
     parser.add_argument("--browser", action="store_true", help="用默认浏览器打开，不开独立窗口")
+    parser.add_argument("--update-job", help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    pending = active_request(ROOT)
+    if pending:
+        expected = ROOT / "tmp/updates" / pending["job"] / "plan.json"
+        if not args.update_job or Path(args.update_job).resolve() != expected.resolve():
+            log("游戏库正在更新，更新后会自动打开")
+            return
+        maintenance["updating"] = True
+    elif args.update_job:
+        log("更新任务已结束，请正常打开游戏库")
+        return
 
     if already_running():
         log("游戏库已经开着了，把窗口叫到前台")
@@ -1021,21 +1138,16 @@ def main():
     if not args.browser:
         scraper.itch_browser = shell.itch
     log("正在扫描游戏文件夹……")
-    result = library.scan()
+    result = {"total": len(library.list_games()), "added": []} if args.update_job else library.scan()
     log(f"游戏库里共 {result['total']} 个游戏" + (f"，新入库 {len(result['added'])} 个" if result["added"] else ""))
 
     port = pick_port()
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
     threading.Thread(target=server.run, daemon=True).start()
-    threading.Thread(target=tracker.loop, daemon=True).start()
-    threading.Thread(target=auto_scan_loop, daemon=True).start()
-    threading.Thread(target=worker.loop, daemon=True).start()
-    imports.cleanup()
-    threading.Thread(target=imports.loop, daemon=True).start()
-    worker.enqueue(library.unprocessed_games())
-    worker.enqueue_icons()
     while not server.started:
         time.sleep(0.1)
+
+    threading.Thread(target=start_background, args=(args.browser, args.update_job), daemon=True).start()
 
     url = f"http://127.0.0.1:{port}/"
     log(f"游戏库已打开：{url}")
@@ -1043,8 +1155,8 @@ def main():
         webbrowser.open(url)
         log("在浏览器里打开了游戏库。关掉这个黑窗口就会退出")
         try:
-            while True:
-                time.sleep(1)
+            while not exit_requested.wait(1):
+                pass
         except KeyboardInterrupt:
             pass
     else:
@@ -1052,6 +1164,7 @@ def main():
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("gamegame.library")
         shell.run(url)
     server.should_exit = True
+    software_updates.stop.set()
     log("已退出")
 
 

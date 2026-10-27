@@ -1,4 +1,4 @@
-# PyInstaller 打包配置：游戏库和自动解压两个 exe 共用一个 _internal 文件夹。
+# 游戏库和自动解压共用 _internal；更新助手独立打包，才能替换正在使用的程序文件。
 # 用 packaging\build.py 调用，不直接运行。
 from pathlib import Path
 
@@ -46,4 +46,14 @@ COLLECT(
     extract_exe, extract.binaries, extract.datas,
     name="塞西莉亚的游戏库",
     upx=False,
+)
+
+helper = Analysis(
+    [str(ROOT / "update_helper.py")],
+    pathex=[str(ROOT)],
+    excludes=EXCLUDES,
+)
+EXE(
+    PYZ(helper.pure), helper.scripts, helper.binaries, helper.datas,
+    name="更新助手", icon=ICON, console=False, upx=False,
 )

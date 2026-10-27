@@ -17,7 +17,8 @@
 
 - Windows 10 / 11，Python 3.11，7-Zip 装在 `C:\Program Files\7-Zip\`
 - 依赖：`pip install cryptography fastapi uvicorn psutil pywin32 Pillow pywebview certifi`
-- 没有构建步骤，没有打包，没有自动化测试，也没有 lint 配置
+- 接口测试另需 `pip install httpx`
+- 源码无需构建；绿色版用 PyInstaller 打包，更新检查可运行 `python -m unittest discover -s tests`，没有 lint 配置
 
 ## 文件分工
 
@@ -31,6 +32,9 @@
 | `importer.py` | 手动导入：识别拖进来的路径，挪 / 复制 / 原地登记 / 解压；`Importer` 是后台排队线程，复用 `auto_extract.process_group` |
 | `game_manager.py` | FastAPI 路由（`/api/*`）、`PlayTracker` 计时、`RefreshRunner` 刷新解压、`Shell` 窗口生命周期、单实例、皮肤的标题栏颜色 |
 | `window_frame.py` | 自绘标题栏：Win32 子类化去掉系统标题栏，保留系统边框 |
+| `app_version.py` | 软件发布版本，更新检查和打包共用 |
+| `updates.py` | GitHub 正式版检查、下载校验、空闲更新调度；源码只检查，不覆盖源码 |
+| `update_helper.py` | 独立更新助手、更新包清单校验、程序替换、启动确认和失败还原 |
 | `web/index.html` | 页面骨架，含占位符 `__TOKEN__` `__THEME__` `__FRAME__` `__VERSION__`，由 `game_manager.index()` 替换 |
 | `web/app.js` | 全部前端逻辑，原生 JS，无框架、无打包。路由用 hash：`#/`、`#/game/<id>`、`#/settings` |
 | `web/style.css` | 默认皮肤「经典深色」（`steam`），颜色都是 `:root` 上的 CSS 变量 |
@@ -67,7 +71,7 @@ python packaging/build.py
 
 ## 验证改动
 
-没有测试套件，按改动范围自己验：
+更新流程用 `python -m unittest discover -s tests`，其他改动按范围自己验：
 
 - **接口**：用 `fastapi.testclient.TestClient(game_manager.app)`，请求要带 `Host: 127.0.0.1` 和 `X-Token: game_manager.TOKEN` 头。
 - **页面**：`--browser` 模式开起来，用 Playwright 之类的工具截图，两套皮肤都要看（设置页切换，或改 `config.json` 的 `theme`）。
@@ -84,6 +88,7 @@ python packaging/build.py
 - **WebView2 线程**：碰 `window.native` 下的 WebView2 对象必须走 `Shell.on_ui_thread`，在别的线程直接读写会让两边卡死。
 - **itch.io 登录**：官网窗口不挂本机 `js_api`；登录信息不进设置接口、日志或 `config.json`。搜索通过官网窗口内同源请求执行，公开作品详情仍用普通 HTTP 请求。退出只清理 itch.io 的 Cookie，不清理游戏库页面数据；关主窗口时要销毁隐藏的官网窗口。
 - **打包成 exe**：`auto_extract.ROOT` 是可写的数据位置（源码运行时是项目文件夹，打包后是 exe 所在文件夹），`APP_DIR` 是程序自带文件的位置（打包后是 `_internal`）。设置、数据、游戏用 `ROOT`，页面这类随程序发布的文件用 `APP_DIR`。打包后「刷新」调用旁边的 `自动解压.exe`，源码运行时调用 `python.exe auto_extract.py`。新加的随程序发布的文件要写进 `cecilia.spec` 的 `datas`；按名字动态加载的模块要写进 `hiddenimports`。
+- **软件更新**：`app_version.VERSION` 和 GitHub 正式发布标签须一致。构建输出 zip、SHA-256 文件和包内 `update-manifest.json`，发布时上传 zip 和校验文件。更新只接受本仓库正式版且带 GitHub SHA-256 的 zip；助手是独立 exe，不依赖待替换的 `_internal`。只替换 `update_helper.OWNED` 列出的程序项，用户数据不在更新清单里。主程序阻止新写入并等待已有任务；自动解压在两轮之间响应更新标记并退出，助手完成后重开它。新版确认窗口能打开前不启动后台写入，失败则还原程序和升级前的数据库。更新任务放 `tmp/updates`，助手退出后清理，无法还原的备份保留。
 - **拖放导入**：完整文件路径只有 Python 这边拿得到（`Shell.on_drop` 里的 `pywebviewFullPath`），再通过 `window.importDropped(...)` 交给页面。
 - **改设置**：`save_config(updates)` 只合并给出的键。密码列表的增删接口（`/api/passwords`、`/api/passwords/remove`）每次在当下的文件上加减一个，不整份覆盖，因为导入线程也会往里写密码。
 - **目录分工**：`download_dirs` 是待解压来源，`games_dir` 是 PC 成品目录，`watch_dirs` 是额外的游戏扫描目录。下载目录不能与 PC、安卓成品目录重叠。完整解压和套娃检查在中转目录完成，内层失败保留来源原包。`publish_game` 去掉单一包装层并原子放进 `Game_编号`，`.game-library.json` 保存原名供入库和资料匹配。

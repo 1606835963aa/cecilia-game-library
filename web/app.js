@@ -642,6 +642,10 @@ function renderSettingsBody(s) {
   if (!body) return;
   savedPasswords = s.passwords;
   body.innerHTML = `
+    <section class="card" id="software-update-card">
+      <h3>软件更新</h3>
+      <div class="inner" id="software-update"></div>
+    </section>
     <section class="card">
       <h3>皮肤</h3>
       <div class="inner">
@@ -704,6 +708,59 @@ function renderSettingsBody(s) {
     </section>
     <p class="hint">改完马上保存。正在运行的自动解压，下一轮扫描就会用上新设置。</p>`;
   renderItchAccount(s.itch_account);
+  renderSoftwareUpdate(s.software_update);
+}
+
+// 版本和进度优先，检查与下载为次要操作；沿用 --text、--text-2 和 8、12、16px 间距。
+const updateUi = { json: '', polling: false, touched: false, activitySending: false };
+
+function renderSoftwareUpdate(update) {
+  const box = $('#software-update');
+  if (!box || !update) return;
+  updateUi.json = JSON.stringify(update);
+  const working = ['checking', 'downloading', 'installing'].includes(update.phase);
+  const ready = ['available', 'ready'].includes(update.phase) && update.supported;
+  const progress = update.total ? Math.min(100, Math.floor(update.downloaded * 100 / update.total)) : 0;
+  const focused = box.contains(document.activeElement) ? document.activeElement : null;
+  const focusSelector = focused?.dataset.update ? `[data-update="${focused.dataset.update}"]` : focused?.dataset.setting ? `[data-setting="${focused.dataset.setting}"]` : null;
+  box.innerHTML = `
+    <div class="update-version">当前版本 <b>${esc(update.current_version)}</b>${update.latest_version ? `<span>发现 ${esc(update.latest_version)}</span>` : ''}</div>
+    <p class="update-status ${update.phase === 'error' ? 'failed' : ''}" role="status" aria-live="polite">${working ? '<i class="spinner"></i>' : update.phase === 'error' ? ICONS.warn : ''}${esc(update.message)}</p>
+    ${update.phase === 'downloading' ? `<progress class="update-progress" value="${progress}" max="100" aria-label="更新下载进度">${progress}%</progress><p class="hint">${fmtSize(update.downloaded)} / ${fmtSize(update.total)} · ${progress}%</p>` : ''}
+    ${update.supported ? toggleRow('auto_update', '自动更新', '打开时检查新版，自动下载；游戏和后台任务结束、停止操作一分钟后更新并重新打开。', update.auto_update) : ''}
+    <div class="update-actions">
+      <button class="btn" data-update="check" ${working || update.phase === 'ready' ? 'disabled' : ''}>检查更新</button>
+      ${ready ? `<button class="btn" data-update="install">${update.phase === 'ready' ? '更新并重新打开' : '下载并更新'}</button>` : ''}
+      <a class="link" href="${esc(update.release_url)}" target="_blank" rel="noopener">发布页 ${ICONS.external}</a>
+    </div>
+    ${update.checked_at ? `<p class="hint update-checked">上次检查 ${esc(update.checked_at)}</p>` : ''}`;
+  if (focusSelector) box.querySelector(focusSelector)?.focus({ preventScroll: true });
+}
+
+async function pollSoftwareUpdate() {
+  if (updateUi.polling || state.route.page !== 'settings') return;
+  updateUi.polling = true;
+  try {
+    const update = await api('GET', '/api/updates');
+    if (JSON.stringify(update) !== updateUi.json) renderSoftwareUpdate(update);
+  } catch { /* 重启期间保留最后的进度 */ }
+  finally { updateUi.polling = false; }
+}
+
+async function softwareUpdateAction(action, button) {
+  await busyButton(button, '处理中', async () => {
+    renderSoftwareUpdate(await api('POST', `/api/updates/${action}`));
+  });
+}
+
+async function sendUpdateActivity() {
+  const editing = !!document.activeElement?.matches('input:not([type=checkbox]):not([type=radio]), textarea, select') || !!$('dialog[open]');
+  if (updateUi.activitySending || (!updateUi.touched && !editing)) return;
+  updateUi.touched = false;
+  updateUi.activitySending = true;
+  try { await api('POST', '/api/updates/activity', { editing }); }
+  catch { /* 更新重启时无需弹出连接错误 */ }
+  finally { updateUi.activitySending = false; }
 }
 
 // 登录状态优先，登录或官网设置是主要操作；沿用 --text、--text-2 和 8、12、16px 间距。
@@ -1516,6 +1573,7 @@ view.addEventListener('click', async e => {
   if (t.hasAttribute('data-wish-check')) return checkWish(state.route.id, t);
   if (t.hasAttribute('data-wish-attach')) return openWishAttach(state.route.id);
   if (t.dataset.itch) return itchAction(t.dataset.itch, t);
+  if (t.dataset.update) return softwareUpdateAction(t.dataset.update, t);
   if (t.dataset.pickDir) return pickDirectory(t.dataset.pickDir, t);
   if (t.dataset.openDir) {
     try { await api('POST', `/api/directories/${t.dataset.openDir}/open`); }
@@ -1799,3 +1857,6 @@ setInterval(load, POLL_MS);
 pollImports(true);
 pollRefresh(true);
 setInterval(pollItchAccount, 2000);
+setInterval(pollSoftwareUpdate, 2000);
+for (const event of ['pointerdown', 'keydown', 'input', 'focusin']) document.addEventListener(event, () => { updateUi.touched = true; }, { passive: true });
+setInterval(sendUpdateActivity, 5000);
