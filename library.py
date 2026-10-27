@@ -45,7 +45,8 @@ EXTRA_COLUMNS = {
     "genres": "TEXT DEFAULT ''",          # 资料网站给的类型标签，用顿号分开
     "meta_source": "TEXT DEFAULT ''",     # 资料来源：steam / vndb，空 = 没匹配上网上的资料
     "meta_id": "TEXT DEFAULT ''",         # 在资料网站上的编号
-    "scraped": "INTEGER DEFAULT 0",       # 1 = 已经自动找过资料，不再自动找
+    "scraped": "INTEGER DEFAULT 0",       # 1 = 本地资料已处理或已匹配，0 = 仍需补查
+    "scrape_status": "TEXT DEFAULT ''",   # 区分未匹配、联网失败和用户主动清除，补查时不恢复已清除的资料
     "name_locked": "INTEGER DEFAULT 0",   # 1 = 名字手动改过，刮削不改名
     "is_wishlist": "INTEGER DEFAULT 0",
     "wishlisted_at": "TEXT DEFAULT ''",
@@ -58,7 +59,7 @@ EXTRA_COLUMNS = {
 }
 # 刮削能写的字段
 META_FIELDS = {"name", "cover", "hero", "logo", "screenshots", "description", "developer", "released",
-               "genres", "meta_source", "meta_id", "scraped", "icon"}
+               "genres", "meta_source", "meta_id", "scraped", "scrape_status", "icon"}
 IMAGE_SIZES = {"cover": (900, 1350), "hero": (2560, 1440), "logo": (1200, 600), "shot": (1600, 900), "icon": (256, 256)}
 # Ren'Py runtime/renpy_icon.ico、Godot platform/windows/godot.ico 的各尺寸默认图标。
 ENGINE_ICON_HASHES = frozenset({
@@ -647,6 +648,15 @@ def unprocessed_games():
     """还没自动找过资料的游戏。"""
     with connect() as conn:
         return [row["id"] for row in conn.execute("SELECT id FROM games WHERE scraped=0 AND missing=0 AND is_wishlist=0")]
+
+
+def unmatched_games():
+    """刷新时补查未匹配或上次失败的记录，用户主动清除的资料保持原样。"""
+    with connect() as conn:
+        return [row["id"] for row in conn.execute(
+            "SELECT id FROM games WHERE missing=0 AND is_wishlist=0 AND scrape_status<>'cleared'"
+            " AND (meta_source='' OR scraped=0)"
+        )]
 
 
 def folder_key(game):

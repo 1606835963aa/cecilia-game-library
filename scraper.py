@@ -1,4 +1,4 @@
-"""游戏资料刮削：从游戏文件、Steam、VNDB、DLsite、itch.io 找游戏的真名、封面、横幅大图、Logo、简介和截图。
+"""游戏资料刮削：从游戏文件和资料网站找游戏的真名、封面、横幅大图、Logo、简介和截图。
 
 来源：
 - 游戏文件（不联网）：Ren'Py / Godot / RPG Maker / Unity 游戏里存的游戏名和主菜单背景、Logo
@@ -6,7 +6,8 @@
 - VNDB（视觉小说数据库）：公开接口，很多 Ren'Py 游戏在上面，有封面、简介、标签、截图
 - DLsite：日本同人游戏商店，按作品编号（RJ 开头）查最准；用的是它自己网页在用的接口和作品网页
 - itch.io：独立游戏商店，用的是搜索网页和每个游戏页面的 data.json
-DLsite 和 itch.io 不是正式开放的接口，网站改版后可能要跟着改。
+- SubscribeStar：订阅平台作者主页的公开介绍、头像和横幅
+网页资料来源改版后，解析规则可能要跟着改。
 
 只读游戏文件里的数据，不会运行游戏里的任何东西。
 """
@@ -23,7 +24,9 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.error import HTTPError
 
 import library
 import wishlist
@@ -413,13 +416,13 @@ def ini_title(folder):
     return m.group(1).strip() if m else None
 
 
-def unity_name(folder):
-    """Unity 游戏的 xxx_Data/app.info 第二行是游戏名。"""
+def unity_info(folder):
+    """开发者和游戏名一起读取，站内搜索漏掉作品时还能核对官方页面。"""
     for info in folder.glob("*_Data/app.info"):
         lines = info.read_text(encoding="utf-8", errors="replace").splitlines()
         if len(lines) >= 2 and lines[1].strip():
-            return lines[1].strip()
-    return None
+            return lines[1].strip(), lines[0].strip()
+    return None, ""
 
 
 def pick_hero(images):
@@ -452,7 +455,7 @@ def pick_logo(images):
 
 def local_info(game):
     """从游戏文件里找真名、横幅大图和 Logo。"""
-    result = {"name": None, "hero": None, "logo": None}
+    result = {"name": None, "developer": "", "hero": None, "logo": None}
     folder = library.to_abs(game["path"])
     if game["platform"] != "PC" or not folder.is_dir():
         return result
@@ -467,7 +470,8 @@ def local_info(game):
         elif engine == "RPG Maker VX/XP":
             name, images = ini_title(folder), []
         elif engine == "Unity":
-            name, images = unity_name(folder), []
+            name, result["developer"] = unity_info(folder)
+            images = []
         else:
             return result
     except Exception:
@@ -728,12 +732,122 @@ def itch_details(url):
     }
 
 
+def itch_from_developer(term, developer):
+    """只接受游戏名和开发者都对得上的候选，不能把同名作品自动套进来。"""
+    slug = re.sub(r"[^a-z0-9]+", "-", term.lower()).strip("-")
+    author = re.sub(r"[^a-z0-9-]", "", developer.lower())
+    if (not slug or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", author)
+            or normalize(developer) in ("defaultcompany", "companyname", "unknown")):
+        return []
+    try:
+        meta = itch_details(f"https://{author}.itch.io/{slug}")
+    except HTTPError as error:
+        if error.code in (404, 410):
+            return []
+        raise
+    except LookupError:
+        return []
+    if normalize(meta["title"]) != normalize(term) or normalize(meta["developer"]) != normalize(developer):
+        return []
+    return [search_result(meta)]
+
+
+# ---------------------------------------------------------------- 订阅平台公开主页
+class PageMetadata(HTMLParser):
+    def __init__(self, page):
+        super().__init__()
+        self.meta = {}
+        self.images = []
+        self.feed(page)
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "meta":
+            key = attrs.get("property") or attrs.get("name")
+            if key:
+                self.meta[key.lower()] = attrs.get("content", "")
+        elif tag == "img":
+            self.images.append(attrs)
+
+
+def subscribestar_url(text):
+    try:
+        parsed = urllib.parse.urlsplit(str(text).strip())
+        host = (parsed.hostname or "").lower().removeprefix("www.")
+        slug = parsed.path.strip("/")
+        reserved = {"posts", "search", "creators", "login", "sign_up", "subscriptions", "features", "pricing", "about"}
+        if (parsed.scheme not in ("https", "http") or parsed.username or parsed.password
+                or parsed.port not in (None, 80, 443)
+                or host not in ("subscribestar.adult", "subscribestar.art", "subscribestar.com")
+                or not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", slug, re.I) or slug.lower() in reserved):
+            return None
+        host = "subscribestar.adult" if host == "subscribestar.art" else host
+        return f"https://{host}/{slug.lower()}"
+    except ValueError:
+        return None
+
+
+def subscribestar_details(url):
+    url = subscribestar_url(url)
+    if not url:
+        raise LookupError("请粘贴订阅平台的作者主页地址")
+    try:
+        page = get_text(url)
+    except HTTPError as error:
+        if error.code in (404, 410):
+            raise LookupError("没有找到这个作者主页") from None
+        raise
+    parsed = PageMetadata(page)
+    raw_title = parsed.meta.get("og:title", "")
+    title = re.sub(r"\s+on\s+subscribestar\.(?:adult|art|com)\s*$", "", raw_title, flags=re.I).strip()
+    if not title or normalize(title) in ("subscribestar", "subscribestaradult", "subscribestarart"):
+        raise LookupError("没有读到这个作者主页的资料")
+    description_tag = next((m for m in re.finditer(r'<div\b[^>]*\bclass=["\']([^"\']+)["\'][^>]*>', page, re.I)
+                            if "profile_main_info-description" in m.group(1).split()), None)
+    description = html_text(inner_div(page, description_tag.group(0)[4:])) if description_tag else ""
+    if not description:
+        raise LookupError("作者主页暂时没有公开介绍")
+
+    def image_url(attrs):
+        value = attrs.get("src", "") if attrs else ""
+        if not value:
+            return ""
+        value = urllib.parse.urljoin(url, value)
+        return value if urllib.parse.urlsplit(value).scheme in ("https", "http") else ""
+
+    cover = next((a for a in parsed.images if "profile_main_info-cover" in a.get("class", "").split()), None)
+    avatar = next((a for a in parsed.images if a.get("data-type") == "avatar" and normalize(a.get("alt")) == normalize(title)), None)
+    return {
+        "source": "subscribestar", "id": url, "title": title, "description": description,
+        "developer": title, "released": "", "genres": [],
+        **version_fields(title, description),
+        "cover": image_url(avatar), "hero": image_url(cover), "logo": "", "icon": image_url(avatar),
+        "screenshots": [],
+    }
+
+
+def subscribestar_search(term):
+    """先核对同名作者主页，用户名不一致的主页可直接粘贴链接匹配。"""
+    slug = re.sub(r"[^a-z0-9]+", "-", term.lower()).strip("-")
+    if not slug or len(slug) > 100:
+        return []
+    try:
+        meta = subscribestar_details(f"https://subscribestar.adult/{slug}")
+    except HTTPError as error:
+        if error.code in (404, 410):
+            return []
+        raise
+    except LookupError:
+        return []
+    return [search_result(meta)] if normalize(meta["title"]) == normalize(term) else []
+
+
 # ---------------------------------------------------------------- 搜索与匹配
-SEARCHERS = {"steam": steam_search, "vndb": vndb_search, "dlsite": dlsite_search, "itch": itch_search}
-DETAILS = {"steam": steam_details, "vndb": vndb_details, "dlsite": dlsite_details, "itch": itch_details}
-SOURCE_LABELS = {"steam": "Steam", "vndb": "VNDB", "dlsite": "DLsite", "itch": "itch.io"}
+SEARCHERS = {"steam": steam_search, "vndb": vndb_search, "dlsite": dlsite_search, "itch": itch_search, "subscribestar": subscribestar_search}
+DETAILS = {"steam": steam_details, "vndb": vndb_details, "dlsite": dlsite_details, "itch": itch_details, "subscribestar": subscribestar_details}
+SOURCE_LABELS = {"steam": "Steam", "vndb": "VNDB", "dlsite": "DLsite", "itch": "itch.io", "subscribestar": "SubscribeStar"}
 # 自动匹配时几家都对上名字，用排在前面的（Steam 的图最适合游戏库）
-SOURCE_ORDER = ("steam", "vndb", "dlsite", "itch")
+SOURCE_ORDER = ("steam", "vndb", "dlsite", "itch", "subscribestar")
 # 粘贴进来的游戏页面地址（DLsite 直接写作品编号也行）
 LINKS = (
     ("steam", re.compile(r"(?:store\.steampowered\.com|steamcommunity\.com)/app/(\d+)", re.I)),
@@ -745,6 +859,9 @@ LINKS = (
 
 def parse_link(text):
     """认出游戏页面地址是哪个网站的哪个游戏，返回 (来源, 编号)。"""
+    subscription = subscribestar_url(text)
+    if subscription:
+        return "subscribestar", subscription
     for source, pattern in LINKS:
         m = pattern.search(text)
         if m:
@@ -752,6 +869,12 @@ def parse_link(text):
                 return source, itch_url(text)
             return source, m.group(1).upper() if source == "dlsite" else m.group(1).lower()
     return None
+
+
+def search_result(meta):
+    return {"source": meta["source"], "id": meta["id"], "title": meta["title"], "alt": "",
+            "thumb": meta.get("cover") or meta.get("hero", ""), "year": meta.get("released", "")[:4],
+            "developer": meta.get("developer", "")}
 
 
 def lookup_link(source, item_id):
@@ -762,11 +885,10 @@ def lookup_link(source, item_id):
         return [], []
     except Exception:
         return [], [source]
-    return [{"source": source, "id": meta["id"], "title": meta["title"], "alt": "",
-             "thumb": meta["cover"] or meta["hero"], "year": meta["released"][:4], "developer": meta["developer"]}], []
+    return [search_result(meta)], []
 
 
-def search(term):
+def search(term, developer=""):
     """同时搜所有来源，返回 (结果列表, 出错的来源)。粘贴的是游戏页面地址就直接查那一个。"""
     link = parse_link(term)
     if link:
@@ -779,7 +901,24 @@ def search(term):
                 results.extend(fut.result())
             except Exception:
                 errors.append(src)
+    if developer and not exact_match(term, results):
+        try:
+            results.extend(itch_from_developer(term, developer))
+        except Exception:
+            if "itch" not in errors:
+                errors.append("itch")
     return results, errors
+
+
+def local_developer(game):
+    if game.get("platform") != "PC":
+        game = library.find_twin(game) or game
+    if game.get("engine") == "Unity":
+        try:
+            return unity_info(library.to_abs(game["path"]))[1]
+        except OSError:
+            pass
+    return game.get("developer") or ""
 
 
 def exact_match(term, results):
@@ -836,11 +975,18 @@ def apply(game_id, meta, local):
     """把找到的资料和图片存下来。手动换过的封面、横幅大图和手动改过的名字不动。"""
     meta = meta or {}
     game = library.get_game(game_id)
+    if not game:
+        return {"game_id": game_id, "cancelled": True}
     urls = {k: meta.get(k, "") for k in ("cover", "hero", "logo", "icon")}
     shot_urls = meta.get("screenshots") or []
     with ThreadPoolExecutor(6) as pool:
         images = dict(zip(urls, pool.map(download_image, urls.values())))
         shots = [img for img in pool.map(download_image, shot_urls) if img is not None]
+    current = library.get_game(game_id)
+    if not current or (current["scrape_status"] == "cleared" and game["scrape_status"] != "cleared"):
+        return {"game_id": game_id, "cancelled": True}
+    # 下载期间用户可能换图或改名，保存时要以当下的手动设置为准。
+    game = current
     cover = images["cover"]
     if cover is not None and cover.width > cover.height:  # 横版的“封面”放在封面墙上会被裁坏，改当背景
         images["hero"] = images["hero"] or cover
@@ -886,9 +1032,10 @@ def apply(game_id, meta, local):
     if not keep_shots:
         fields["screenshots"] = [library.save_image(img, f"{game_id}-shot{i}.jpg", "shot") for i, img in enumerate(shots)]
     fields.update(
-        description=meta.get("description", ""), developer=meta.get("developer", ""),
+        description=meta.get("description", ""), developer=meta.get("developer") or local.get("developer", ""),
         released=meta.get("released", ""), genres="、".join(meta.get("genres") or []),
         meta_source=meta.get("source", ""), meta_id=meta.get("id", ""), scraped=1,
+        scrape_status="matched" if meta.get("source") else "local",
     )
     new_name = meta.get("title") or local["name"]
     if new_name and not game["name_locked"]:
@@ -911,7 +1058,7 @@ def local_for(game):
 def auto_scrape(game_id, online=True):
     """自动找资料：先看游戏文件，再用真名和文件夹名去网上搜，名字完全对上才套用。
 
-    返回 (说明, 是否连上了网)；网络出错时不标记“已找过”，下次启动再试。
+    返回 (说明, 是否连上了网)；未匹配或联网失败时保留补查状态，已有资料按原官网地址更新。
     """
     game = library.get_game(game_id)
     if not game or game["missing"]:
@@ -925,8 +1072,17 @@ def auto_scrape(game_id, online=True):
     local, twin = local_for(game)
     names = [twin and twin["name"], local["name"], game["name"]]
     meta, reachable = None, True
-    code = find_dlsite_code(twin or game) if online else None
-    if code:
+    source = game["meta_source"]
+    if online and source in DETAILS and game["meta_id"]:
+        try:
+            meta = DETAILS[source](game["meta_id"])
+        except Exception:
+            library.set_meta(game_id, {"scraped": 0, "scrape_status": "error"})
+            return "官网暂时没连上，已保留原来的资料", False
+    elif not online and source:
+        return "已保留原来的官网资料", True
+    code = find_dlsite_code(twin or game) if online and not meta else None
+    if code and not meta:
         try:
             meta = dlsite_details(code)
         except LookupError:
@@ -936,7 +1092,7 @@ def auto_scrape(game_id, online=True):
     if online and not meta:
         terms = list(dict.fromkeys(t for t in names if t and normalize(t)))
         for term in terms:
-            results, errors = search(term)
+            results, errors = search(term, developer=local.get("developer") or game.get("developer") or "")
             reachable = reachable and not errors
             hit = exact_match(term, results)
             if hit:
@@ -944,9 +1100,16 @@ def auto_scrape(game_id, online=True):
                 break
     if twin and not meta and not twin["name_locked"]:
         local["name"] = local["name"] or twin["name"]
-    apply(game_id, meta, local)
-    if not reachable and not meta:
-        library.set_meta(game_id, {"scraped": 0})
+    if source and not meta:
+        return "暂时没找到官网资料，已保留原来的内容", False
+    current = library.get_game(game_id)
+    if not current or (current["scrape_status"] == "cleared" and game["scrape_status"] != "cleared"):
+        return "已停止更新，保留手动清除的结果", True
+    applied = apply(game_id, meta, local)
+    if applied.get("cancelled"):
+        return "已停止更新，保留手动清除的结果", True
+    if online and not meta:
+        library.set_meta(game_id, {"scraped": 0, "scrape_status": "unmatched" if reachable else "error"})
     found = "、".join(k for k, v in (("名字", local["name"]), ("背景图", local["hero"]), ("Logo", local["logo"])) if v)
     if meta:
         return f"在 {SOURCE_LABELS[meta['source']]} 上找到「{meta['title']}」", reachable
@@ -967,6 +1130,7 @@ def clear(game_id):
     if game["is_wishlist"]:
         raise ValueError("愿望单需要保留官网来源，如不再关注可移除这条记录")
     apply(game_id, None, local_for(game)[0])
+    library.set_meta(game_id, {"scrape_status": "cleared"})
 
 
 def add_wishlist(source, item_id, baseline=""):
@@ -1026,6 +1190,10 @@ class Worker:
         if load_config().get("auto_scrape", True):
             self.enqueue([g["id"] for g in library.list_games() if needs_site_icon(g)], icons_only=True)
 
+    def enqueue_unmatched(self):
+        if load_config().get("auto_scrape", True):
+            self.enqueue(library.unmatched_games())
+
     def busy(self):
         with self.lock:
             return set(self.pending)
@@ -1036,6 +1204,8 @@ class Worker:
             try:
                 online = bool(load_config().get("auto_scrape", True))
                 game = library.get_game(gid)
+                if not game or game["scrape_status"] == "cleared":
+                    continue
                 if task == "version":
                     msg = check_wishlist_version(gid) if online else ""
                 elif task == "icon":

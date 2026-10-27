@@ -25,7 +25,7 @@
 | --- | --- |
 | `auto_extract.py` | 解压引擎和基础工具：`load_config` / `save_config`、`DEFAULT_CONFIG`、`ROOT`、分卷识别（`archive_group`）、试密码（`choose_password`，一次把所有候选都试完）、GBK 密码 zip 自解密、套娃解压、安卓版分流、`scan_once` / `watch_loop` |
 | `library.py` | SQLite 数据库（`data/library.db`，表 `games` 和 `sessions`）、引擎识别、主程序挑选、扫描入库、图标提取、低完整性标签修复、回收站删除 |
-| `scraper.py` | 找资料：游戏文件本地读取（Ren'Py rpa、Godot pck、RPG Maker、Unity）+ Steam / VNDB / DLsite / itch.io；`Worker` 是后台排队线程 |
+| `scraper.py` | 找资料：游戏文件本地读取（Ren'Py rpa、Godot pck、RPG Maker、Unity）+ Steam / VNDB / DLsite / itch.io / SubscribeStar 公开主页；`Worker` 是后台排队线程 |
 | `itch_account.py` | itch.io 官网登录窗口、登录和成人内容状态检测、同一浏览器会话中的搜索、退出清理；登录状态由 WebView2 保存在 `data/webview` |
 | `wishlist.py` | 无本地文件的愿望单、加入时版本和官网版本历史、与已下载游戏的关联 |
 | `importer.py` | 手动导入：识别拖进来的路径，挪 / 复制 / 原地登记 / 解压；`Importer` 是后台排队线程，复用 `auto_extract.process_group` |
@@ -93,6 +93,7 @@ python packaging/build.py
 - **手动改过的不覆盖**：`exe_locked=1` 的主程序扫描不改；文件名带 `-custom` 的封面、背景是手动换的，找资料时不覆盖。
 - **皮肤**：新组件先在 `style.css` 用变量写，浪子的真情皮肤需要不同样子时在 `theme-paper.css` 的 `[data-theme="paper"]` 下覆盖。加皮肤还要在 `game_manager.THEMES` 里配标题栏和底色。
 - **资料来源**：DLsite 和 itch.io 用的不是公开接口，抓取失败先怀疑网站改版。只读游戏文件里的数据，不运行游戏里的任何东西（`scraper._BasicTypesOnly` 限制了 pickle 能还原的类型）。
+- **资料补查**：刷新会给未匹配或上次失败的本地记录补查资料。`scrape_status=cleared` 是用户主动清除，自动补查跳过；手动点「自动获取」仍可重新匹配。已匹配的记录优先按原官网地址更新，联网失败保留已有内容。订阅平台只读取作者主页的公开介绍、头像和横幅，不把帖子日期当版本号。
 - **界面文字**：全部中文，口语、简短，面向不懂电脑的用户。错误信息用 `HTTPException(状态码, "中文说明")`，前端会直接弹出来。
 
 ## 规矩

@@ -355,6 +355,7 @@ def scan_and_queue(full=False):
         log(f"新入库：{'、'.join(result['added'])}")
         worker.enqueue(result["added_ids"])
     if full:
+        worker.enqueue_unmatched()
         worker.enqueue_versions()
         worker.enqueue_icons()
     return result
@@ -380,10 +381,11 @@ def api_refresh():
 
 
 @app.get("/api/search")
-def api_search(q: str):
+def api_search(q: str, game_id: int | None = None):
     if not q.strip():
         return {"results": [], "errors": []}
-    results, errors = scraper.search(q.strip())
+    developer = scraper.local_developer(require_game(game_id)) if game_id is not None else ""
+    results, errors = scraper.search(q.strip(), developer=developer)
     return {"results": results, "errors": errors, "itch_account": shell.itch.snapshot()}
 
 
@@ -858,7 +860,7 @@ class Shell:
 
     def on_itch_ready(self):
         if load_config().get("auto_scrape", True):
-            worker.enqueue([g["id"] for g in library.list_games() if not g["meta_source"] and not g["missing"]])
+            worker.enqueue(library.unmatched_games())
 
     def run(self, url):
         try:

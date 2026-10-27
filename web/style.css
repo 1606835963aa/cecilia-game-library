@@ -631,6 +631,7 @@ select:focus-visible { box-shadow: 0 0 0 1px var(--blue-soft); outline: 0; }
 .src.vndb { background: rgba(180, 140, 255, .14); color: #c3a6ff; }
 .src.dlsite { background: rgba(70, 150, 255, .14); color: #7fb4ff; }
 .src.itch { background: rgba(250, 92, 92, .14); color: #ff8a8a; }
+.src.subscribestar { background: var(--surface-2); color: var(--blue-soft); }
 .m-current { color: var(--blue-soft); font-size: 12px; font-weight: 600; padding: 0 8px; }
 .m-row .btn { min-width: 84px; }
 .m-note { margin: 4px 24px 8px; padding: 8px 12px; border-radius: var(--r-sm); background: rgba(227, 179, 65, .1); color: var(--warn); font-size: 12px; }

@@ -96,7 +96,7 @@ ARCHIVE_MAGIC = (
 # 网盘里常把压缩包改成这些后缀躲审核（比如 .rar 改成 .pdf），只对这些后缀看文件头
 SNIFF_SUFFIXES = {"", ".txt", ".pdf", ".jpg", ".png", ".mp4", ".iso", ".img", ".bin"}
 
-PART_RAR = re.compile(r"^(?P<base>.+)\.part(?P<n>\d+)\.rar$", re.I)
+PART_RAR = re.compile(r"^(?P<base>.+)\.part\s*(?P<n>\d+)(?P<ext>\.[^.]+)$", re.I)
 SEVEN_SPLIT = re.compile(r"^(?P<base>.+)\.(?:zip|rar|7z)\.(?P<n>\d{3})$", re.I)
 Z_SPLIT = re.compile(r"^(?P<base>.+)\.z\d{2}$", re.I)
 R_SPLIT = re.compile(r"^(?P<base>.+)\.r\d{2}$", re.I)
@@ -258,13 +258,17 @@ def archive_group(path):
     parent = path.parent
 
     m = PART_RAR.match(name)
-    if m:
+    if m and (m.group("ext").lower() == ".rar" or rar_multivolume(path)):
         if int(m.group("n")) != 1:
             return None
         base = m.group("base").lower()
+        ext = m.group("ext").lower()
         parts = _sibling_parts(parent, lambda p: bool(PART_RAR.match(canon(p.name)))
-                              and PART_RAR.match(canon(p.name)).group("base").lower() == base)
-        return {"trigger": path, "parts": parts, "key": (parent / base).as_posix().lower()}
+                              and PART_RAR.match(canon(p.name)).group("base").lower() == base
+                              and PART_RAR.match(canon(p.name)).group("ext").lower() == ext)
+        parts.sort(key=lambda p: int(PART_RAR.match(canon(p.name)).group("n")))
+        return {"trigger": path, "parts": parts, "key": (parent / (base + ext)).as_posix().lower(),
+                "name_override": m.group("base")}
 
     m = SEVEN_SPLIT.match(name)
     if m:
@@ -317,6 +321,28 @@ def sniff_archive(path):
         if head.startswith(magic):
             return kind
     return None
+
+
+def rar_multivolume(path):
+    """改过后缀的分卷也要成组，但不能把名字带 part 的独立压缩包跳过。"""
+    if sniff_archive(path) != "rar":
+        return False
+    try:
+        stat = path.stat()
+        return _rar_multivolume(str(path), stat.st_size, stat.st_mtime_ns, find_seven_zip(load_config()))
+    except OSError:
+        return False
+
+
+@lru_cache(maxsize=512)
+def _rar_multivolume(path, size, modified, seven):
+    if not seven:
+        return False
+    try:
+        _, listing = run_7z(seven, ["l", "-slt", "-sccUTF-8", "-p-", path], timeout=20)
+        return bool(re.search(r"^Multivolume = \+\s*$", listing, re.M))
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 def executable_archive(path):
@@ -962,7 +988,7 @@ def process_nested(seven, directory, passwords, cfg, depth, watch_roots, progres
             if progress:
                 progress({"phase": "result", "file": trigger.name, "path": str(trigger), "ok": False, "message": note})
             continue
-        target = organize(staging, parent, clean_name(trigger), parent == directory)
+        target = organize(staging, parent, group.get("name_override") or clean_name(trigger), parent == directory)
         log(f"  嵌套包已解压：{trigger.name}")
         # 内层包是外层包里的副本，成品中只留解压后的内容。
         delete_group_files(group)

@@ -44,15 +44,18 @@
 
   <div class="layout">
     <aside class="sidebar">
+      <!-- 搜索优先、排序其次；沿用 --surface-2、--text-2 和侧栏 6px 间距。 -->
       <div class="side-tools">
         <label class="search">
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
           <input id="search" type="search" placeholder="搜索（按 / 键）" autocomplete="off">
         </label>
-        <select id="platform" aria-label="平台">
-          <option value="全部">全部平台</option>
-          <option value="PC">PC</option>
-          <option value="安卓">安卓</option>
+        <select id="sort" aria-label="排序方式" title="排序方式">
+          <option value="added">最新入库</option>
+          <option value="recent">最近玩过</option>
+          <option value="name">游戏名称</option>
+          <option value="playtime">游戏时长</option>
+          <option value="size">占用空间</option>
         </select>
       </div>
       <nav id="side-list" class="side-list" aria-label="游戏列表"></nav>

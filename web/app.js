@@ -6,6 +6,7 @@ const SOURCES = {
   vndb: { label: 'VNDB', link: id => `https://vndb.org/${id}` },
   dlsite: { label: 'DLsite', link: id => `https://www.dlsite.com/maniax/work/=/product_id/${id}.html` },
   itch: { label: 'itch.io', link: id => id },
+  subscribestar: { label: 'SubscribeStar', link: id => id },
 };
 
 const ICONS = {
@@ -39,9 +40,8 @@ const ANDROID_HELP = {
 const state = {
   games: [],
   statuses: [],
-  platform: '全部',
   statusFilter: '全部',
-  sort: localGet('sort') || 'recent',
+  sort: localGet('sort') || 'added',
   q: '',
   collapsed: new Set(JSON.parse(localGet('collapsed') || '[]')),
   route: { page: 'home' },
@@ -182,17 +182,20 @@ function blurBg(g, name, cls = 'blur') {
 // ---------------------------------------------------------------- 筛选
 function matches(g) {
   const q = state.q.trim().toLowerCase();
-  return (state.platform === '全部' || g.platform === state.platform) &&
-    (!q || [g.name, g.tags, g.genres, g.developer].some(t => (t || '').toLowerCase().includes(q)));
+  return !q || [g.name, g.tags, g.genres, g.developer].some(t => (t || '').toLowerCase().includes(q));
 }
 
 const SORTS = {
-  recent: (a, b) => (b.last_played || '').localeCompare(a.last_played || '') || b.added_at.localeCompare(a.added_at),
-  added: (a, b) => b.added_at.localeCompare(a.added_at),
+  recent: (a, b) => (b.last_played || '').localeCompare(a.last_played || '') || SORTS.added(a, b),
+  added: (a, b) => b.added_at.localeCompare(a.added_at) || b.id - a.id,
   name: (a, b) => a.name.localeCompare(b.name, 'zh-CN'),
   playtime: (a, b) => b.play_seconds - a.play_seconds,
   size: (a, b) => b.size_bytes - a.size_bytes,
 };
+
+function compareGames(a, b) {
+  return (a.missing - b.missing) || (SORTS[state.sort] || SORTS.added)(a, b);
+}
 
 // ---------------------------------------------------------------- 左侧列表
 function thumbHtml(g) {
@@ -203,14 +206,15 @@ function thumbHtml(g) {
 }
 
 function renderSidebar() {
-  const list = state.games.filter(matches).sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'));
+  const list = state.games.filter(matches).sort(compareGames);
   const activeId = state.route.page === 'game' ? state.route.id : null;
   let html = `<a class="side-home ${state.route.page === 'home' ? 'active' : ''}" href="#/">${ICONS.home}<span>全部游戏</span></a>`;
-  for (const status of ['愿望单', ...GROUP_ORDER]) {
-    const items = list.filter(g => status === '愿望单' ? g.is_wishlist : !g.is_wishlist && g.status === status);
+  for (const status of ['愿望单', ...GROUP_ORDER, '安卓']) {
+    const items = list.filter(g => status === '愿望单' ? g.is_wishlist
+      : !g.is_wishlist && (status === '安卓' ? g.platform === '安卓' : g.platform !== '安卓' && g.status === status));
     if (!items.length) continue;
     const collapsed = state.collapsed.has(status);
-    html += `<button class="group-head ${collapsed ? 'collapsed' : ''}" data-group="${status}">${ICONS.chevron}${status}<span class="n">${items.length}</span></button>`;
+    html += `<button class="group-head ${collapsed ? 'collapsed' : ''}" data-group="${status}" aria-expanded="${!collapsed}">${ICONS.chevron}${status}<span class="n">${items.length}</span></button>`;
     if (collapsed) continue;
     html += items.map(g => `
       <a data-gid="${g.id}" class="side-item ${g.id === activeId ? 'active' : ''} ${isRunning(g) ? 'running' : ''} ${g.missing ? 'missing' : ''}" href="#/game/${g.id}" title="${esc(g.name)}">
@@ -306,7 +310,7 @@ function renderHome() {
   const spot = byRecent.find(isRunning) || byRecent[0];
   const recent = base.filter(g => g.last_played && g !== spot).sort(SORTS.recent).slice(0, 10);
   const wall = base.filter(g => wishPage || state.statusFilter === '全部' || (state.statusFilter === '愿望单' ? g.is_wishlist : !g.is_wishlist && g.status === state.statusFilter))
-    .sort((a, b) => (a.missing - b.missing) || SORTS[state.sort](a, b));
+    .sort(compareGames);
   const scroll = view.scrollTop;
   view.innerHTML = `
     <div class="home">
@@ -320,10 +324,6 @@ function renderHome() {
           ${wishPage ? '<button class="btn btn-primary" data-add-wish>添加游戏</button>' : `<select id="status-filter" aria-label="状态">
             ${['全部', '愿望单', ...state.statuses].map(s => `<option value="${s}" ${s === state.statusFilter ? 'selected' : ''}>${s === '全部' ? '全部状态' : s}</option>`).join('')}
           </select>`}
-          <select id="sort" aria-label="排序">
-            ${[['recent', '按最近玩过'], ['added', '按加入时间'], ['name', '按名字'], ['playtime', '按游戏时间'], ['size', '按占用空间']]
-              .map(([v, t]) => `<option value="${v}" ${v === state.sort ? 'selected' : ''}>${t}</option>`).join('')}
-          </select>
         </div>
       </div>
       ${wall.length ? `<div class="wall">${wall.map(tileHtml).join('')}</div>` : `<div class="empty-state"><p>${wishPage ? '先搜名字、保存资料，想玩的时候再下载。' : '没有符合条件的游戏'}</p></div>`}
@@ -378,7 +378,7 @@ function aboutHtml(g) {
   } else if (g.scraping) {
     body = '<p class="placeholder"><i class="spinner"></i>正在找这个游戏的资料……</p>';
   } else {
-    body = `<div class="placeholder">还没有这个游戏的简介。<button class="link" data-match>匹配资料</button>，从 Steam 或 VNDB 找一下。</div>`;
+    body = `<div class="placeholder">还没有这个游戏的简介。点<button class="link" data-match>匹配资料</button>搜索，或粘贴游戏官网、作者主页的链接。</div>`;
   }
   return `
     <section class="card">
@@ -696,7 +696,7 @@ function renderSettingsBody(s) {
     </section>
     <section class="card">
       <h3>游戏资料</h3>
-      <div class="inner">${toggleRow('auto_scrape', '新游戏自动联网找资料', '会把游戏名发给 Steam、VNDB、DLsite 和 itch.io 搜索。关掉后只从游戏文件里取，联网要在游戏页面手动点「匹配资料」。', s.auto_scrape)}</div>
+      <div class="inner">${toggleRow('auto_scrape', '自动联网找资料', '从资料网站和订阅平台公开主页找资料；点刷新也会补查没匹配上的游戏。关掉后只读取游戏文件，需要时可以手动匹配。', s.auto_scrape)}</div>
     </section>
     <section class="card" id="itch-account-card">
       <h3>itch.io 账号</h3>
@@ -955,7 +955,8 @@ async function runSearch() {
   if (!q) return;
   box.innerHTML = Array.from({ length: 4 }, () => '<div class="m-row skeleton"><div class="m-thumb"></div><div class="m-info"><i></i><i></i></div></div>').join('');
   try {
-    const { results, errors, itch_account: account } = await api('GET', `/api/search?q=${encodeURIComponent(q)}`);
+    const context = state.matchId == null ? '' : `&game_id=${state.matchId}`;
+    const { results, errors, itch_account: account } = await api('GET', `/api/search?q=${encodeURIComponent(q)}${context}`);
     if (q !== $('#match-q').value.trim()) return;
     state.matchResults = results;
     const g = game(state.matchId);
@@ -1478,8 +1479,11 @@ $('#search').addEventListener('input', e => {
   renderSidebar();
   if (['home', 'wishlist'].includes(state.route.page)) renderHome();
 });
-$('#platform').addEventListener('change', e => {
-  state.platform = e.target.value;
+$('#sort').value = Object.prototype.hasOwnProperty.call(SORTS, state.sort) ? state.sort : 'added';
+state.sort = $('#sort').value;
+$('#sort').addEventListener('change', e => {
+  state.sort = e.target.value;
+  localSet('sort', state.sort);
   renderSidebar();
   if (['home', 'wishlist'].includes(state.route.page)) renderHome();
 });
@@ -1572,7 +1576,6 @@ view.addEventListener('change', async e => {
     } catch (err) { toast(err.message, true); }
     return;
   }
-  if (t.id === 'sort') { state.sort = t.value; localSet('sort', t.value); return renderHome(); }
   if (t.id === 'status-filter') { state.statusFilter = t.value; return renderHome(); }
   if (t.name === 'android') return saveSettings({ android: t.value });
   if (t.name === 'theme') {
