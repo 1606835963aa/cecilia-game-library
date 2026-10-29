@@ -128,6 +128,23 @@ def normalize(text):
 
 
 VERSION_NUMBER = r"(\d+(?:\.\d+){1,4}(?:[ -]?(?:alpha|beta|rc|a|b)\d*)?)"
+VERSION_MARKER = r"(?:v(?:er(?:sion)?)?\.?|版本|バージョン)"
+SEARCH_VERSION_SUFFIX = re.compile(
+    r"(?:[\s_-]+" + VERSION_MARKER + r"\s*[:：=]?\s*" + VERSION_NUMBER
+    + r"|\s*[\[【(（]\s*" + VERSION_MARKER + r"\s*[:：=]?\s*" + VERSION_NUMBER + r"\s*[\]】)）])"
+    + r"(?:[\s_-]+(?:pc|win32|win64|windows|android))?\s*$", re.I,
+)
+
+
+def search_title(text):
+    """搜索不带下载版本后缀；只有明确的版本标记才去掉，作品名里的数字仍保留。"""
+    text = (text or "").strip()
+    match = SEARCH_VERSION_SUFFIX.search(text)
+    if match:
+        title = text[:match.start()].rstrip(" _-")
+        if title:
+            return title
+    return text
 
 
 def version_fields(title="", description="", page=""):
@@ -893,6 +910,9 @@ def search(term, developer=""):
     link = parse_link(term)
     if link:
         return lookup_link(*link)
+    term = search_title(term)
+    if not normalize(term):
+        return [], []
     results, errors = [], []
     with ThreadPoolExecutor(len(SEARCHERS)) as pool:
         futures = {src: pool.submit(fn, term) for src, fn in SEARCHERS.items()}
@@ -923,10 +943,10 @@ def local_developer(game):
 
 def exact_match(term, results):
     """名字完全对得上的才算（Steam 优先）；对不上就不自动套用，免得套错。"""
-    key = normalize(term)
+    key = normalize(search_title(term))
     for src in SOURCE_ORDER:
         for r in results:
-            if r["source"] == src and key and key in (normalize(r["title"]), normalize(r.get("alt"))):
+            if r["source"] == src and key and key in (normalize(search_title(r["title"])), normalize(search_title(r.get("alt")))):
                 return r
     return None
 
@@ -1090,7 +1110,7 @@ def auto_scrape(game_id, online=True):
         except Exception:
             reachable = False
     if online and not meta:
-        terms = list(dict.fromkeys(t for t in names if t and normalize(t)))
+        terms = list(dict.fromkeys(search_title(t) for t in names if t and normalize(search_title(t))))
         for term in terms:
             results, errors = search(term, developer=local.get("developer") or game.get("developer") or "")
             reachable = reachable and not errors
