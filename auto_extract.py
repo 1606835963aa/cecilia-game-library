@@ -95,9 +95,9 @@ ARCHIVE_MAGIC = (
     (b"7z\xbc\xaf\x27\x1c", "7z"),
 )
 # 网盘里常把压缩包改成这些后缀躲审核（比如 .rar 改成 .pdf），只对这些后缀看文件头
-SNIFF_SUFFIXES = {"", ".txt", ".pdf", ".jpg", ".png", ".mp4", ".iso", ".img", ".bin"}
+SNIFF_SUFFIXES = {"", ".txt", ".pdf", ".jpg", ".png", ".gif", ".mp4", ".iso", ".img", ".bin"}
 
-PART_RAR = re.compile(r"^(?P<base>.+)\.part\s*(?P<n>\d+)(?P<ext>\.[^.]+)$", re.I)
+PART_RAR = re.compile(r"^(?P<base>.+)\.part\s*(?P<n>\d+)(?P<ext>(?:\.[^.]+)+)$", re.I)
 SEVEN_SPLIT = re.compile(r"^(?P<base>.+)\.(?:zip|rar|7z)\.(?P<n>\d{3})$", re.I)
 Z_SPLIT = re.compile(r"^(?P<base>.+)\.z\d{2}$", re.I)
 R_SPLIT = re.compile(r"^(?P<base>.+)\.r\d{2}$", re.I)
@@ -263,22 +263,25 @@ def _sibling_parts(parent, predicate):
 
 def archive_group(path):
     """判断 path 是不是压缩包（或分卷第一份），返回 dict 或 None。"""
+    if not path.is_file():
+        return None
     name = canon(path.name)
     low = name.lower()
     parent = path.parent
 
     m = PART_RAR.match(name)
-    if m and (m.group("ext").lower() == ".rar" or rar_multivolume(path)):
+    if m and rar_multivolume(path):
         if int(m.group("n")) != 1:
             return None
         base = m.group("base").lower()
-        ext = m.group("ext").lower()
-        parts = _sibling_parts(parent, lambda p: bool(PART_RAR.match(canon(p.name)))
-                              and PART_RAR.match(canon(p.name)).group("base").lower() == base
-                              and PART_RAR.match(canon(p.name)).group("ext").lower() == ext)
+        def belongs(part):
+            match = PART_RAR.match(canon(part.name))
+            return part.is_file() and match and match.group("base").lower() == base and rar_multivolume(part)
+
+        parts = _sibling_parts(parent, belongs)
         parts.sort(key=lambda p: int(PART_RAR.match(canon(p.name)).group("n")))
-        return {"trigger": path, "parts": parts, "key": (parent / (base + ext)).as_posix().lower(),
-                "name_override": m.group("base")}
+        return {"trigger": path, "parts": parts, "key": (parent / (base + ".rar")).as_posix().lower(),
+                "name_override": m.group("base"), "rar_parts": True}
 
     m = SEVEN_SPLIT.match(name)
     if m:
@@ -339,18 +342,32 @@ def rar_multivolume(path):
         return False
     try:
         stat = path.stat()
-        return _rar_multivolume(str(path), stat.st_size, stat.st_mtime_ns, find_seven_zip(load_config()))
+        cfg = load_config()
+        passwords = collect_hints(path.parent, cfg.get("passwords") or [], recursive=False)
+        for ancestor in path.parent.parents:
+            if ancestor != ROOT and ROOT not in ancestor.parents:
+                break
+            passwords = collect_hints(ancestor, passwords, recursive=False)
+        return _rar_multivolume(str(path), stat.st_size, stat.st_mtime_ns, find_seven_zip(cfg), tuple(passwords))
     except OSError:
         return False
 
 
 @lru_cache(maxsize=512)
-def _rar_multivolume(path, size, modified, seven):
+def _rar_multivolume(path, size, modified, seven, passwords=()):
     if not seven:
         return False
     try:
-        _, listing = run_7z(seven, ["l", "-slt", "-sccUTF-8", "-p-", path], timeout=20)
-        return bool(re.search(r"^Multivolume = \+\s*$", listing, re.M))
+        # 文件列表加密时，先用已有密码读出分卷标记；缓存随密码列表变化，添加密码后立即重试。
+        for password in (None, *passwords):
+            _, listing = run_7z(seven, ["l", "-slt", "-sccUTF-8", "-p" + (password if password is not None else "-"), path], timeout=20)
+            if re.search(r"^Multivolume = \+\s*$", listing, re.M):
+                return True
+            if re.search(r"^Multivolume = -\s*$", listing, re.M):
+                return False
+            if "encrypted archive" not in listing.lower() and "wrong password" not in listing.lower():
+                return False
+        return False
     except (OSError, subprocess.TimeoutExpired):
         return False
 
@@ -409,7 +426,38 @@ def _executable_archive(path, size, modified, seven):
 
 @contextmanager
 def readable_group(group):
-    """分卷自解压包只拼接成数据文件，整个流程都由 7-Zip 读取。"""
+    """临时统一分卷名称或拼接自解压包，原文件只读，整个流程都由 7-Zip 读取。"""
+    if group.get("rar_parts") and any(not re.fullmatch(r".+\.part\d+\.rar", part.name, re.I) for part in group["parts"]):
+        temporary_root = ROOT / "tmp"
+        alias_root = temporary_root / "archive-read"
+        created_temporary_root = not temporary_root.exists()
+        created_alias_root = not alias_root.exists()
+        aliases = alias_root / uuid4().hex
+        aliases.mkdir(parents=True)
+        try:
+            parts = []
+            for part in group["parts"]:
+                number = int(PART_RAR.match(canon(part.name)).group("n"))
+                alias = aliases / f"archive.part{number}.rar"
+                try:
+                    os.link(part, alias)
+                except OSError:
+                    if shutil.disk_usage(aliases).free < part.stat().st_size:
+                        raise ValueError("临时空间不足，无法读取改过名字的分卷")
+                    shutil.copy2(part, alias)
+                parts.append(alias)
+            yield dict(group, trigger=parts[0], parts=parts)
+        finally:
+            if aliases.resolve().parent != alias_root.resolve():
+                raise ValueError("分卷临时目录的位置不正确")
+            shutil.rmtree(aliases)
+            for folder, created in ((alias_root, created_alias_root), (temporary_root, created_temporary_root)):
+                if created:
+                    try:
+                        folder.rmdir()
+                    except OSError:
+                        pass
+        return
     if not group.get("sfx"):
         yield group
         return
@@ -438,6 +486,10 @@ def group_signature(group):
 def archive_complete(group):
     """7z 头记录了末尾位置，缺分卷时不能把读取失败误报成密码错误。"""
     trigger = group["trigger"]
+    if group.get("rar_parts"):
+        numbers = [int(PART_RAR.match(canon(part.name)).group("n")) for part in group["parts"]]
+        if numbers != list(range(1, len(numbers) + 1)):
+            return False
     if sniff_archive(trigger) != "7z" and not canon(trigger.name).lower().endswith(".exe"):
         return True
     try:
