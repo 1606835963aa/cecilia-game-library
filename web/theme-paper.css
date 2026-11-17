@@ -240,11 +240,13 @@
 [data-theme="paper"] .alert { box-shadow: 0 0 0 1px var(--line), inset 4px 0 0 var(--warn), 4px 5px 0 0 #f1e6cc; }
 
 [data-theme="paper"] .field input[type=text],
+[data-theme="paper"] .field input[type=password],
 [data-theme="paper"] .field textarea,
 [data-theme="paper"] .field select,
 [data-theme="paper"] .search.big,
 [data-theme="paper"] .i-retry input { background: #fffdf7; border: 1px solid var(--line); box-shadow: none; }
 [data-theme="paper"] .field input[type=text]:focus,
+[data-theme="paper"] .field input[type=password]:focus,
 [data-theme="paper"] .field textarea:focus,
 [data-theme="paper"] .field select:focus,
 [data-theme="paper"] .i-retry input:focus { border-color: var(--sage); box-shadow: 0 0 0 3px rgba(135, 182, 160, .25); }
@@ -282,6 +284,9 @@
 [data-theme="paper"] .dialog { background: var(--surface) var(--grain); border-color: var(--line); box-shadow: 6px 8px 0 0 var(--mint-2), 0 30px 60px -20px rgba(38, 71, 59, .55); }
 [data-theme="paper"] .dialog::backdrop { background: rgba(58, 84, 72, .28); }
 [data-theme="paper"] .dialog h2 { color: var(--ink); font-family: var(--serif); }
+[data-theme="paper"] .group-dialog .btn-primary { background: var(--leaf); color: var(--surface); }
+[data-theme="paper"] .group-dialog .btn-primary:hover { background: var(--ink); }
+[data-theme="paper"] .group-actions .link { color: var(--leaf); }
 [data-theme="paper"] .m-row:hover,
 [data-theme="paper"] .i-row:hover { background: rgba(227, 238, 220, .5); }
 [data-theme="paper"] .m-row.current { background: var(--mint-1); }

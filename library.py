@@ -4,10 +4,13 @@ import io
 import json
 import os
 import re
+import secrets
 import sqlite3
 import struct
 import subprocess
 import threading
+import unicodedata
+from contextlib import closing, contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -56,6 +59,7 @@ EXTRA_COLUMNS = {
     "version_status": "TEXT DEFAULT ''",
     "version_evidence": "TEXT DEFAULT ''",
     "version_history": "TEXT DEFAULT '[]'",
+    "group_id": "INTEGER REFERENCES game_groups(id) ON DELETE SET NULL",
 }
 # 刮削能写的字段
 META_FIELDS = {"name", "cover", "hero", "logo", "screenshots", "description", "developer", "released",
@@ -77,17 +81,25 @@ ENGINE_ICON_HASHES = frozenset({
 
 
 # ---------------------------------------------------------------- 数据库
+@contextmanager
 def connect():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.row_factory = sqlite3.Row
-    return conn
+    # 分组和图片请求会频繁查询，事务结束时立即释放 Windows 上的文件句柄。
+    with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn, conn:
+        conn.row_factory = sqlite3.Row
+        yield conn
 
 
 def init_db():
     with connect() as conn:
         conn.executescript(
             """
+            CREATE TABLE IF NOT EXISTS game_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                password_salt BLOB,
+                password_hash BLOB
+            );
             CREATE TABLE IF NOT EXISTS games (
                 id INTEGER PRIMARY KEY,
                 path TEXT UNIQUE NOT NULL,      -- 游戏文件夹（安卓游戏是 apk 文件），项目内的用相对路径
@@ -122,6 +134,7 @@ def init_db():
         for column, definition in EXTRA_COLUMNS.items():
             if column not in have:
                 conn.execute(f"ALTER TABLE games ADD COLUMN {column} {definition}")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_games_group ON games(group_id)")
         # 图标单独放在 icon 里，cover 只放真正的封面
         conn.execute("UPDATE games SET icon=cover, cover='' WHERE cover LIKE '%-icon.png'")
         # 上次异常退出时没收尾的游玩记录，按已记下的时长补上结束时间
@@ -563,23 +576,139 @@ def games_under(path):
     path = Path(path).resolve()
     with connect() as conn:
         rows = conn.execute("SELECT id, name, path FROM games WHERE is_wishlist=0").fetchall()
-    return [{"id": r["id"], "name": r["name"]} for r in rows
+    return [dict(r) for r in rows
             if (p := to_abs(r["path"]).resolve()) == path or path in p.parents]
 
 
+# ---------------------------------------------------------------- 游戏分组
+GROUP_NAME_LIMIT = 48
+GROUP_PASSWORD_LIMIT = 128
+RESERVED_GROUP_NAMES = {*STATUSES, "安卓", "愿望单", "全部游戏", "默认分组"}
+
+
+def _available_groups(unlocked_groups):
+    ids = tuple(unlocked_groups)
+    placeholders = ", ".join("?" for _ in ids)
+    return f"password_hash IS NULL OR id IN ({placeholders})", ids
+
+
+def _visible_game_group(column, unlocked_groups):
+    condition, ids = _available_groups(unlocked_groups)
+    return f"({column} IS NULL OR {column} IN (SELECT id FROM game_groups WHERE {condition}))", ids
+
+
+def list_groups(unlocked_groups):
+    condition, ids = _available_groups(unlocked_groups)
+    with connect() as conn:
+        rows = conn.execute(f"SELECT id, name, password_hash IS NOT NULL AS hidden FROM game_groups WHERE {condition} ORDER BY id", ids)
+        return [{"id": row["id"], "name": row["name"], "hidden": bool(row["hidden"])} for row in rows]
+
+
+def locked_games(unlocked_groups):
+    condition, ids = _visible_game_group("group_id", unlocked_groups)
+    with connect() as conn:
+        return {row["id"]: row["path"] for row in conn.execute(f"SELECT id, path FROM games WHERE NOT {condition}", ids)}
+
+
+def _check_group_name(conn, name, unlocked_groups, editing=None):
+    name = " ".join(name.split()) if isinstance(name, str) else ""
+    if not name or len(name) > GROUP_NAME_LIMIT or not name.isprintable():
+        raise ValueError(f"请填写 {GROUP_NAME_LIMIT} 个字以内的分组名称")
+    normalized = unicodedata.normalize("NFKC", name).casefold()
+    if normalized in RESERVED_GROUP_NAMES:
+        raise ValueError("这个名字已被内置分组使用")
+    condition, ids = _available_groups(unlocked_groups)
+    rows = conn.execute(f"SELECT id, name FROM game_groups WHERE {condition}", ids)
+    if any(row["id"] != editing and unicodedata.normalize("NFKC", row["name"]).casefold() == normalized for row in rows):
+        raise ValueError("已经有同名分组了")
+    return name
+
+
+def _group_password_bytes(password):
+    if not isinstance(password, str) or not password.strip() or len(password) > GROUP_PASSWORD_LIMIT:
+        raise ValueError(f"请填写 {GROUP_PASSWORD_LIMIT} 个字以内的密码")
+    return password.encode("utf-8")
+
+
+def _group_password_hash(password, salt):
+    return hashlib.pbkdf2_hmac("sha256", password, salt, 600_000)
+
+
+def create_group(name, hidden, password, unlocked_groups):
+    # 密码校验的计算比较慢，放在数据库写入锁之外。
+    salt, digest = None, None
+    if hidden:
+        password = _group_password_bytes(password)
+        salt = secrets.token_bytes(16)
+        digest = _group_password_hash(password, salt)
+    with _db_lock, connect() as conn:
+        name = _check_group_name(conn, name, unlocked_groups)
+        cursor = conn.execute("INSERT INTO game_groups (name, password_salt, password_hash) VALUES (?, ?, ?)",
+                              (name, salt, digest))
+        return {"id": cursor.lastrowid, "name": name, "hidden": hidden}
+
+
+def groups_matching_password(password):
+    password = _group_password_bytes(password)
+    with connect() as conn:
+        rows = conn.execute("SELECT id, password_salt, password_hash FROM game_groups WHERE password_hash IS NOT NULL").fetchall()
+    return {row["id"] for row in rows
+            if secrets.compare_digest(row["password_hash"], _group_password_hash(password, row["password_salt"]))}
+
+
+def _require_group(conn, group_id, unlocked_groups):
+    if not 0 < group_id < 2**63:
+        raise LookupError("分组不存在")
+    condition, ids = _available_groups(unlocked_groups)
+    if not conn.execute(f"SELECT 1 FROM game_groups WHERE id=? AND ({condition})", (group_id, *ids)).fetchone():
+        raise LookupError("分组不存在")
+
+
+def rename_group(group_id, name, unlocked_groups):
+    with _db_lock, connect() as conn:
+        _require_group(conn, group_id, unlocked_groups)
+        name = _check_group_name(conn, name, unlocked_groups, editing=group_id)
+        conn.execute("UPDATE game_groups SET name=? WHERE id=?", (name, group_id))
+
+
+def delete_group(group_id, unlocked_groups):
+    with _db_lock, connect() as conn:
+        _require_group(conn, group_id, unlocked_groups)
+        conn.execute("UPDATE games SET group_id=NULL WHERE group_id=?", (group_id,))
+        conn.execute("DELETE FROM game_groups WHERE id=?", (group_id,))
+
+
+def set_game_group(game_id, group_id, unlocked_groups):
+    if not 0 < game_id < 2**63:
+        raise LookupError("游戏不存在")
+    condition, ids = _visible_game_group("group_id", unlocked_groups)
+    with _db_lock, connect() as conn:
+        row = conn.execute(f"SELECT is_wishlist FROM games WHERE id=? AND {condition}", (game_id, *ids)).fetchone()
+        if row is None:
+            raise LookupError("游戏不存在")
+        if row["is_wishlist"]:
+            raise ValueError("请先给这款游戏关联本地文件")
+        if group_id is not None:
+            _require_group(conn, group_id, unlocked_groups)
+        conn.execute("UPDATE games SET group_id=? WHERE id=?", (group_id, game_id))
+
+
 # ---------------------------------------------------------------- 查询与修改
-def list_games(running=None):
+def list_games(running=None, *, unlocked_groups=None):
     running = running or {}
+    condition, ids = ("1", ()) if unlocked_groups is None else _visible_game_group("g.group_id", unlocked_groups)
     with connect() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT g.*,
                    COALESCE(SUM(s.seconds), 0) AS play_seconds,
                    COUNT(s.id) AS play_count,
                    MAX(s.started_at) AS last_played
             FROM games g LEFT JOIN sessions s ON s.game_id = g.id
+            WHERE {condition}
             GROUP BY g.id
-            """
+            """,
+            ids,
         ).fetchall()
     games = []
     for row in rows:
@@ -592,9 +721,10 @@ def list_games(running=None):
     return games
 
 
-def get_game(game_id):
+def get_game(game_id, *, unlocked_groups=None):
+    condition, ids = ("1", ()) if unlocked_groups is None else _visible_game_group("group_id", unlocked_groups)
     with connect() as conn:
-        row = conn.execute("SELECT * FROM games WHERE id=?", (game_id,)).fetchone()
+        row = conn.execute(f"SELECT * FROM games WHERE id=? AND {condition}", (game_id, *ids)).fetchone()
     return dict(row) if row else None
 
 

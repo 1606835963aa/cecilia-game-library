@@ -18,9 +18,9 @@ from pathlib import Path
 
 import auto_extract
 import library
-from auto_extract import (IMPORTING_DIR, PART_RAR, R_SPLIT, ROOT, SEVEN_SPLIT, SKIP_DIRS, Z_SPLIT, android_root,
+from auto_extract import (IMPORTING_DIR, PART_RAR, R_SPLIT, ROOT, SEVEN_SPLIT, SKIP_DIRS, Z_SPLIT, add_password, android_root,
                           archive_group, canon, clean_name, find_seven_zip, is_android_file, is_temp_file, load_config,
-                          process_group, resolve_dir, save_config, unique)
+                          process_group, resolve_dir, unique)
 
 # 和自动解压（另一个进程）分开用中转文件夹，两边同时解压也不会互相覆盖
 IMPORT_WORK_DIR = ROOT / "data" / "import"
@@ -230,9 +230,12 @@ class Importer:
             self.queue.put(job)
         return [j["id"] for j in jobs]
 
-    def jobs(self):
+    def jobs(self, locked_games=None):
+        locked_games = locked_games or {}
+        locked_paths = set(locked_games.values())
         with self.lock:
-            return [{k: v for k, v in j.items() if k != "password"} for j in self.records]
+            return [{k: v for k, v in j.items() if k not in ("password", "added_games")} for j in self.records
+                    if not any(gid in locked_games or path in locked_paths for gid, path in j.get("added_games", ()))]
 
     def busy(self):
         with self.lock:
@@ -280,7 +283,8 @@ class Importer:
         done = {"move": f"已挪进{folder}", "copy": f"已复制进{folder}", "link": "已登记，文件留在原处"}[job["mode"]]
         done += job.get("warning", "")
         self.log(f"导入：{job['name']}（{done}）")
-        self.update(job, state="done", message=done if new else "游戏库里本来就有", game_id=gid)
+        self.update(job, state="done", message=done if new else "游戏库里本来就有", game_id=gid,
+                    added_games=[(gid, library.to_rel(target))])
 
     def transfer(self, job, src, target, dest_root):
         same_drive = os.path.splitdrive(str(src))[0].lower() == os.path.splitdrive(str(dest_root))[0].lower()
@@ -356,7 +360,7 @@ class Importer:
             shutil.rmtree(staging, ignore_errors=True)
             prune(staging.parent)
         if job["password"] and job["password"] not in saved:
-            save_config({"passwords": saved + [job["password"]]})
+            add_password(job["password"])
 
         self.update(job, message="登记中")
         result = library.scan()
@@ -378,7 +382,8 @@ class Importer:
             except (ValueError, OSError) as e:
                 message += f"（压缩包没删掉：{e}）"
         self.log(f"导入：{job['name']}（{message}）")
-        self.update(job, state="done", message=message, game_id=found[0]["id"] if len(found) == 1 else None)
+        self.update(job, state="done", message=message, game_id=found[0]["id"] if len(found) == 1 else None,
+                    added_games=[(g["id"], g["path"]) for g in found])
 
     def retry(self, job_id, password):
         with self.lock:

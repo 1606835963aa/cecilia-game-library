@@ -14,6 +14,8 @@ out/
 target/
 __pycache__/
 *.pyc
+# 由固定版本下载脚本准备的冷藏编解码器
+codecs/
 *.egg-info/
 .venv/
 venv/

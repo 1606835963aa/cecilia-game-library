@@ -11,6 +11,7 @@ import argparse
 import ctypes
 import json
 import os
+import re
 import secrets
 import socket
 import subprocess
@@ -45,7 +46,7 @@ try:
     import uvicorn
     import webview
     from webview.dom import DOMEventHandler
-    from fastapi import FastAPI, HTTPException, Request
+    from fastapi import FastAPI, HTTPException, Request, Response
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
     from fastapi.staticfiles import StaticFiles
 except ImportError as e:
@@ -60,8 +61,8 @@ from app_version import VERSION
 from update_helper import active_request
 from itch_account import ItchAccount
 from window_frame import CustomFrame
-from auto_extract import (ANDROID_MODES, APP_DIR, EVENT_PREFIX, FROZEN, ROOT, android_root, download_roots,
-                          find_seven_zip, games_root, load_config, save_config, scan_lock, validate_layout)
+from auto_extract import (ANDROID_MODES, APP_DIR, EVENT_PREFIX, FROZEN, ROOT, add_password, android_root, download_roots,
+                          find_seven_zip, games_root, load_config, remove_password, save_config, scan_lock, validate_layout)
 
 WEB_DIR = APP_DIR / "web"
 ICON = WEB_DIR / "icon.ico"
@@ -70,6 +71,10 @@ WEBVIEW_DATA = ROOT / "data" / "webview"
 PORT = int(os.environ.get("GAME_LIBRARY_PORT") or 8765)  # 开发时换个端口，就能和正在用的游戏库同时开
 APP_ID = "game-library"
 TOKEN = secrets.token_hex(16)
+GROUP_COOKIE = f"cecilia_groups_{PORT}"
+group_session_lock = threading.Lock()
+group_sessions = {}
+group_session_generation = 0
 AUTO_SCAN_SECONDS = 60
 maintenance_lock = threading.Lock()
 maintenance = {"updating": False, "writes": 0, "scans": 0}
@@ -188,9 +193,9 @@ class RefreshRunner:
         self.state = {"id": 0, "running": False, "phase": "idle", "message": "", "results": []}
         self.starting_games = set()
 
-    def snapshot(self):
+    def snapshot(self, locked_games=None):
         with self.lock:
-            return self.snapshot_unlocked()
+            return self.snapshot_unlocked(locked_games)
 
     def busy(self):
         with self.lock:
@@ -216,8 +221,24 @@ class RefreshRunner:
         threading.Thread(target=self.run, daemon=True).start()
         return state
 
-    def snapshot_unlocked(self):
-        return dict(self.state, results=list(self.state["results"]))
+    def snapshot_unlocked(self, locked_games=None):
+        state = dict(self.state, results=list(self.state["results"]))
+        if state["phase"] == "done":
+            locked_games = locked_games or {}
+            locked_paths = set(locked_games.values())
+            current = [g for g in state.pop("games") if g[0] not in locked_games and g[1] not in locked_paths]
+            added = [name for _, _, name, is_new in current if is_new]
+            total = len(current)
+            parts = []
+            if state["succeeded"]:
+                parts.append(f"已处理 {state['succeeded']} 项")
+            if state["failed"]:
+                parts.append(f"{state['failed']} 个没解开")
+            if state["waiting"]:
+                parts.append(f"{state['waiting']} 个还在下载，下载完再刷新")
+            parts.append(f"新入库 {len(added)} 个游戏" if added else f"没有新游戏（共 {total} 个）")
+            state.update(message="，".join(parts), added=added, total=total)
+        return state
 
     def run(self):
         try:
@@ -251,21 +272,12 @@ class RefreshRunner:
             if returncode or report is None:
                 raise ValueError("解压程序没能完成，请查看 logs 文件夹里的 extract.log")
             self.update(phase="scanning", message="正在更新游戏列表", file="", **report)
-            result = scan_and_queue(full=True)
+            scan_and_queue(full=True)
             # 自动扫描也会在解压期间入库，按刷新前后的记录比较，才能把抢先入库的也算上。
             current_games = [g for g in library.list_games() if not g["is_wishlist"] and not g["missing"]]
-            added = [g["name"] for g in current_games if (g["id"], g["path"]) not in self.starting_games]
-            parts = []
-            if report["succeeded"]:
-                parts.append(f"已处理 {report['succeeded']} 项")
-            if report["failed"]:
-                parts.append(f"{report['failed']} 个没解开")
-            if report["waiting"]:
-                parts.append(f"{report['waiting']} 个还在下载，下载完再刷新")
-            parts.append(f"新入库 {len(added)} 个游戏" if added else f"没有新游戏（共 {len(current_games)} 个）")
-            message = "，".join(parts)
-            self.update(running=False, phase="done", message=message, added=added, total=len(current_games))
-            log(f"刷新完成：{message}")
+            games = [(g["id"], g["path"], g["name"], (g["id"], g["path"]) not in self.starting_games) for g in current_games]
+            self.update(running=False, phase="done", games=games)
+            log(f"刷新完成：新入库 {sum(is_new for _, _, _, is_new in games)} 个游戏")
         except Exception as e:
             log(f"刷新失败：{e}")
             self.update(running=False, phase="error", message=str(e), file="")
@@ -300,7 +312,9 @@ async def guard(request: Request, call_next):
             with maintenance_lock:
                 maintenance["writes"] -= 1
     # 页面文件每次都先问一下有没有更新，不然窗口会一直用缓存里的旧版页面
-    if request.url.path == "/" or request.url.path.startswith("/web/"):
+    if request.url.path.startswith(("/api/", "/covers/")):
+        response.headers["Cache-Control"] = "no-store"
+    elif request.url.path == "/" or request.url.path.startswith("/web/"):
         response.headers["Cache-Control"] = "no-cache"
     return response
 
@@ -341,15 +355,45 @@ def api_window(action: str):
 
 
 @app.get("/covers/{name}")
-def cover(name: str):
+def cover(name: str, request: Request):
     path = library.COVER_DIR / name
-    if Path(name).name != name or not path.is_file():
+    owner = re.match(r"([0-9]{1,19})-", name)
+    if not owner or Path(name).name != name:
         raise HTTPException(404)
-    return FileResponse(path, headers={"Cache-Control": "no-cache"})
+    require_game(int(owner[1]), request)
+    if not path.is_file():
+        raise HTTPException(404)
+    return FileResponse(path)
 
 
-def require_game(game_id, local=False):
-    game = library.get_game(game_id)
+def unlocked_groups(request):
+    with group_session_lock:
+        return frozenset(group_sessions.get(request.cookies.get(GROUP_COOKIE), ()))
+
+
+def unlock_groups(request, response, ids, generation):
+    with group_session_lock:
+        if generation != group_session_generation:
+            raise HTTPException(409, "隐藏分组已锁定，请重新输入密码")
+        session = request.cookies.get(GROUP_COOKIE)
+        if session not in group_sessions:
+            session = secrets.token_urlsafe(32)
+            group_sessions[session] = set()
+        group_sessions[session].update(ids)
+        response.set_cookie(GROUP_COOKIE, session, httponly=True, samesite="strict")
+
+
+def lock_all_group_sessions():
+    global group_session_generation
+    with group_session_lock:
+        group_sessions.clear()
+        group_session_generation += 1
+
+
+def require_game(game_id, request, local=False):
+    if not 0 < game_id < 2**63:
+        raise HTTPException(404, "游戏不存在")
+    game = library.get_game(game_id, unlocked_groups=unlocked_groups(request))
     if not game:
         raise HTTPException(404, "游戏不存在")
     if local and game["is_wishlist"]:
@@ -358,12 +402,97 @@ def require_game(game_id, local=False):
 
 
 @app.get("/api/games")
-def api_games():
-    games = wishlist.decorate(library.list_games(tracker.seconds()))
+def api_games(request: Request):
+    unlocked = unlocked_groups(request)
+    games = wishlist.decorate(library.list_games(tracker.seconds(), unlocked_groups=unlocked))
     busy = worker.busy()
     for g in games:
         g["scraping"] = g["id"] in busy
-    return {"games": games, "statuses": library.STATUSES}
+    return {"games": games, "statuses": library.STATUSES, "groups": library.list_groups(unlocked)}
+
+
+async def group_fields(request):
+    try:
+        body = await request.json()
+    except ValueError:
+        raise HTTPException(400, "分组表单格式不对")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "分组表单格式不对")
+    return body
+
+
+@app.post("/api/groups")
+async def api_create_group(request: Request, response: Response):
+    fields = await group_fields(request)
+    hidden = fields.get("hidden", False)
+    if type(hidden) is not bool:
+        raise HTTPException(400, "请选择分组类型")
+    generation = group_session_generation
+    try:
+        group = await run_blocking(library.create_group, fields.get("name"), hidden, fields.get("password"), unlocked_groups(request))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if hidden:
+        unlock_groups(request, response, [group["id"]], generation)
+    return group
+
+
+@app.post("/api/groups/unlock")
+async def api_unlock_groups(request: Request, response: Response):
+    password = (await group_fields(request)).get("password")
+    generation = group_session_generation
+    try:
+        ids = await run_blocking(library.groups_matching_password, password)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not ids:
+        raise HTTPException(403, "密码不对")
+    unlock_groups(request, response, ids, generation)
+    return {"ok": True}
+
+
+@app.post("/api/groups/lock")
+def api_lock_groups(request: Request, response: Response):
+    with group_session_lock:
+        group_sessions.pop(request.cookies.get(GROUP_COOKIE), None)
+    response.delete_cookie(GROUP_COOKIE, httponly=True, samesite="strict")
+    return {"ok": True}
+
+
+@app.patch("/api/groups/{group_id}")
+async def api_rename_group(group_id: int, request: Request):
+    name = (await group_fields(request)).get("name")
+    try:
+        await run_blocking(library.rename_group, group_id, name, unlocked_groups(request))
+    except LookupError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
+@app.delete("/api/groups/{group_id}")
+def api_delete_group(group_id: int, request: Request):
+    try:
+        library.delete_group(group_id, unlocked_groups(request))
+    except LookupError as e:
+        raise HTTPException(404, str(e))
+    return {"ok": True}
+
+
+@app.put("/api/games/{game_id}/group")
+async def api_set_game_group(game_id: int, request: Request):
+    fields = await group_fields(request)
+    group_id = fields.get("group_id")
+    if "group_id" not in fields or (group_id is not None and (type(group_id) is not int or not 0 < group_id < 2**63)):
+        raise HTTPException(400, "请选择分组")
+    try:
+        await run_blocking(library.set_game_group, game_id, group_id, unlocked_groups(request))
+    except LookupError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
 
 
 def scan_and_queue(full=False):
@@ -393,8 +522,8 @@ async def api_scan(request: Request):
 
 
 @app.get("/api/refresh")
-def api_refresh_status():
-    return refresh.snapshot()
+def api_refresh_status(request: Request):
+    return refresh.snapshot(library.locked_games(unlocked_groups(request)))
 
 
 @app.post("/api/refresh")
@@ -406,18 +535,18 @@ def api_refresh():
 
 
 @app.get("/api/search")
-def api_search(q: str, game_id: int | None = None):
+def api_search(request: Request, q: str, game_id: int | None = None):
     if not q.strip():
         return {"results": [], "errors": []}
-    developer = scraper.local_developer(require_game(game_id)) if game_id is not None else ""
+    developer = scraper.local_developer(require_game(game_id, request)) if game_id is not None else ""
     results, errors = scraper.search(q.strip(), developer=developer)
     return {"results": results, "errors": errors, "itch_account": shell.itch.snapshot()}
 
 
 @app.post("/api/games/{game_id}/match")
 async def api_match(game_id: int, request: Request):
-    require_game(game_id)
     body = await request.json()
+    require_game(game_id, request)
     try:
         fields = await run_blocking(scraper.apply_match, game_id, body.get("source"), body.get("id"))
     except (ValueError, LookupError) as e:
@@ -434,7 +563,10 @@ async def api_add_wishlist(request: Request):
     if len(baseline) > 80:
         raise HTTPException(400, "版本号请控制在 80 个字以内")
     try:
-        return await run_blocking(scraper.add_wishlist, body.get("source"), body.get("id"), baseline)
+        result = await run_blocking(scraper.add_wishlist, body.get("source"), body.get("id"), baseline)
+        if library.get_game(result["game_id"], unlocked_groups=unlocked_groups(request)) is None:
+            raise HTTPException(409, "暂时无法添加这款游戏")
+        return result
     except (ValueError, LookupError) as e:
         raise HTTPException(400, str(e))
     except OSError:
@@ -442,8 +574,8 @@ async def api_add_wishlist(request: Request):
 
 
 @app.post("/api/wishlist/{game_id}/check")
-async def api_check_wishlist(game_id: int):
-    require_game(game_id)
+async def api_check_wishlist(game_id: int, request: Request):
+    require_game(game_id, request)
     try:
         message = await run_blocking(scraper.check_wishlist_version, game_id)
     except ValueError as e:
@@ -455,9 +587,10 @@ async def api_check_wishlist(game_id: int):
 
 @app.post("/api/wishlist/{game_id}/attach")
 async def api_attach_wishlist(game_id: int, request: Request):
-    require_game(game_id)
     try:
         local_id = int((await request.json()).get("local_id"))
+        require_game(game_id, request)
+        require_game(local_id, request, local=True)
         if local_id in tracker.seconds():
             raise HTTPException(409, "游戏正在运行，退出后再关联")
         return {"game_id": await run_blocking(wishlist.bind, game_id, local_id)}
@@ -467,10 +600,10 @@ async def api_attach_wishlist(game_id: int, request: Request):
 
 @app.patch("/api/wishlist/{game_id}/version")
 async def api_record_wishlist_version(game_id: int, request: Request):
-    game = require_game(game_id)
+    version = str((await request.json()).get("version") or "").strip()
+    game = require_game(game_id, request)
     if not game["wishlisted_at"]:
         raise HTTPException(400, "这款游戏没有愿望单版本记录")
-    version = str((await request.json()).get("version") or "").strip()
     if not version or len(version) > 80:
         raise HTTPException(400, "请填写 80 个字以内的版本号")
     wishlist.record_version(game_id, version, "手动填写", "manual")
@@ -478,16 +611,16 @@ async def api_record_wishlist_version(game_id: int, request: Request):
 
 
 @app.post("/api/games/{game_id}/rescrape")
-async def api_rescrape(game_id: int):
-    game = require_game(game_id)
+async def api_rescrape(game_id: int, request: Request):
+    game = require_game(game_id, request)
     msg, reachable = await run_blocking(scraper.auto_scrape, game_id)
     actual_id = game_id if library.get_game(game_id) else library.find_by_path(library.to_abs(game["path"]))
     return {"message": msg if reachable else msg + "（有资料网站没连上）", "game_id": actual_id}
 
 
 @app.post("/api/games/{game_id}/clear-meta")
-async def api_clear_meta(game_id: int):
-    require_game(game_id)
+async def api_clear_meta(game_id: int, request: Request):
+    require_game(game_id, request)
     try:
         await run_blocking(scraper.clear, game_id)
     except ValueError as e:
@@ -496,7 +629,7 @@ async def api_clear_meta(game_id: int):
 
 
 async def run_blocking(fn, *args):
-    """联网下载比较慢，放到线程里跑，不卡住其他请求。"""
+    """把耗时的联网和文件操作放到线程里，保持其他请求能响应。"""
     import asyncio
 
     return await asyncio.get_running_loop().run_in_executor(None, fn, *args)
@@ -504,17 +637,18 @@ async def run_blocking(fn, *args):
 
 @app.patch("/api/games/{game_id}")
 async def api_update(game_id: int, request: Request):
-    require_game(game_id)
+    fields = await request.json()
+    require_game(game_id, request)
     try:
-        library.update_game(game_id, await request.json())
+        library.update_game(game_id, fields)
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"ok": True}
 
 
 @app.post("/api/games/{game_id}/launch")
-def api_launch(game_id: int):
-    game = require_game(game_id, local=True)
+def api_launch(game_id: int, request: Request):
+    game = require_game(game_id, request, local=True)
     if game["missing"]:
         raise HTTPException(400, "游戏文件夹已经不在了")
     tracker.launch(game)
@@ -522,8 +656,8 @@ def api_launch(game_id: int):
 
 
 @app.post("/api/games/{game_id}/open-folder")
-def api_open_folder(game_id: int):
-    path = library.to_abs(require_game(game_id, local=True)["path"])
+def api_open_folder(game_id: int, request: Request):
+    path = library.to_abs(require_game(game_id, request, local=True)["path"])
     if not path.exists():
         raise HTTPException(400, "游戏文件夹已经不在了")
     if path.is_file():
@@ -534,23 +668,24 @@ def api_open_folder(game_id: int):
 
 
 @app.get("/api/games/{game_id}/exes")
-def api_exes(game_id: int):
-    game = require_game(game_id, local=True)
+def api_exes(game_id: int, request: Request):
+    game = require_game(game_id, request, local=True)
     folder = library.to_abs(game["path"])
     return {"exes": library.list_exes(folder) if folder.is_dir() else [], "current": game["exe"]}
 
 
 @app.get("/api/games/{game_id}/sessions")
-def api_sessions(game_id: int):
-    require_game(game_id)
+def api_sessions(game_id: int, request: Request):
+    require_game(game_id, request)
     return {"sessions": library.recent_sessions(game_id)}
 
 
 @app.post("/api/games/{game_id}/exe")
 async def api_set_exe(game_id: int, request: Request):
-    require_game(game_id, local=True)
+    exe = (await request.json()).get("exe", "")
+    require_game(game_id, request, local=True)
     try:
-        library.set_exe(game_id, (await request.json()).get("exe", ""))
+        library.set_exe(game_id, exe)
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"ok": True}
@@ -561,10 +696,10 @@ IMAGE_KINDS = ("cover", "hero")  # 竖版封面、横幅大图
 
 @app.post("/api/games/{game_id}/image/{kind}")
 async def api_image(game_id: int, kind: str, request: Request):
-    require_game(game_id)
     if kind not in IMAGE_KINDS:
         raise HTTPException(404)
     raw = await request.body()
+    require_game(game_id, request)
     if not raw or len(raw) > 30 * 1024 * 1024:
         raise HTTPException(400, "图片为空或超过 30MB")
     try:
@@ -575,8 +710,8 @@ async def api_image(game_id: int, kind: str, request: Request):
 
 
 @app.delete("/api/games/{game_id}/image/{kind}")
-def api_reset_image(game_id: int, kind: str):
-    require_game(game_id)
+def api_reset_image(game_id: int, kind: str, request: Request):
+    require_game(game_id, request)
     if kind not in IMAGE_KINDS:
         raise HTTPException(404)
     library.reset_image(game_id, kind)
@@ -584,15 +719,15 @@ def api_reset_image(game_id: int, kind: str):
 
 
 @app.delete("/api/games/{game_id}")
-def api_remove(game_id: int):
-    require_game(game_id)
+def api_remove(game_id: int, request: Request):
+    require_game(game_id, request)
     library.remove_game(game_id)
     return {"ok": True}
 
 
 @app.delete("/api/games/{game_id}/files")
-def api_delete_files(game_id: int):
-    game = require_game(game_id, local=True)
+def api_delete_files(game_id: int, request: Request):
+    game = require_game(game_id, request, local=True)
     if game_id in tracker.seconds():
         raise HTTPException(409, "游戏正在运行，先退出游戏再删")
     try:
@@ -646,8 +781,8 @@ async def api_import_retry(job_id: int, request: Request):
 
 
 @app.get("/api/import/jobs")
-def api_import_jobs():
-    return {"jobs": imports.jobs()}
+def api_import_jobs(request: Request):
+    return {"jobs": imports.jobs(library.locked_games(unlocked_groups(request)))}
 
 
 @app.post("/api/import/clear")
@@ -702,14 +837,14 @@ async def api_save_settings(request: Request):
         directories["games_dir"] = body["games_dir"]
     try:
         if directories:
-            save_directories(dict(updates, **directories))
+            await run_blocking(save_directories, dict(updates, **directories))
         else:
-            save_config(updates)
+            await run_blocking(save_config, updates)
     except (OSError, ValueError) as e:
         raise HTTPException(400, f"设置没存上：{e}")
     if "theme" in updates:
-        shell.paint_title_bar()
-    return api_settings()
+        await run_blocking(shell.paint_title_bar)
+    return await run_blocking(api_settings)
 
 
 def save_directories(updates):
@@ -738,10 +873,11 @@ async def api_pick_directory(request: Request):
     if not picked:
         return {"cancelled": True}
     try:
-        save_directories({"download_dirs": [picked[0]]} if kind == "downloads" else {"games_dir": picked[0]})
+        updates = {"download_dirs": [picked[0]]} if kind == "downloads" else {"games_dir": picked[0]}
+        await run_blocking(save_directories, updates)
     except (OSError, ValueError) as e:
         raise HTTPException(400, f"文件夹没改成：{e}")
-    return api_settings()
+    return await run_blocking(api_settings)
 
 
 @app.post("/api/directories/{kind}/open")
@@ -799,25 +935,21 @@ async def api_add_password(request: Request):
     pwd = str((await request.json()).get("password", "")).strip()
     if not pwd:
         raise HTTPException(400, "密码是空的")
-    saved = [str(p) for p in load_config().get("passwords") or []]
-    if pwd in saved:
-        raise HTTPException(400, "这个密码已经在列表里了")
     try:
-        save_config({"passwords": saved + [pwd]})
+        await run_blocking(lambda: add_password(pwd, reject_duplicate=True))
     except (OSError, ValueError) as e:
         raise HTTPException(400, f"密码没存上：{e}")
-    return api_settings()
+    return await run_blocking(api_settings)
 
 
 @app.post("/api/passwords/remove")
 async def api_remove_password(request: Request):
     pwd = str((await request.json()).get("password", ""))
-    saved = [str(p) for p in load_config().get("passwords") or []]
     try:
-        save_config({"passwords": [p for p in saved if p != pwd]})
+        await run_blocking(remove_password, pwd)
     except (OSError, ValueError) as e:
         raise HTTPException(400, f"密码没删掉：{e}")
-    return api_settings()
+    return await run_blocking(api_settings)
 
 
 @app.post("/api/open-android-dir")
@@ -993,6 +1125,7 @@ class Shell:
             self.window.evaluate_js(f"window.importDropped({json.dumps(paths)})")
 
     def on_closing(self):
+        lock_all_group_sessions()
         if tracker.active() or imports.busy() or refresh.busy():
             self.hidden = True
             if self.itch.window:
@@ -1021,6 +1154,9 @@ class Shell:
     def bring_to_front(self):
         if not self.window:
             return
+        if self.hidden:
+            # 关闭回调在窗口线程上，等重新显示时清掉页面上的解锁内容。
+            self.window.evaluate_js("window.hideLockedGroups?.()")
         self.hidden = False
         self.window.show()
         if self.hwnd:

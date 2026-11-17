@@ -1,0 +1,103 @@
+{
+  "format": "CECOLD",
+  "version": 2,
+  "extension": ".cecold",
+  "jpeg_xl_tools": {
+    "version": "0.12.0",
+    "release": "https://github.com/libjxl/libjxl/releases/tag/v0.12.0",
+    "windows_archive": "https://github.com/libjxl/libjxl/releases/download/v0.12.0/jxl-x64-windows-static.zip",
+    "sha256": "3025d7e308390796d20492322e606bc92decaee7b6bc99d3f7547870ae5db7de"
+  },
+  "layout": [
+    {
+      "part": "header",
+      "struct": "<8sII",
+      "magic_hex": "4345434f4c440001",
+      "version": "1：不含 PNG 转换；2：支持 PNG 转换。magic 和其余布局相同",
+      "flags": 0
+    },
+    {
+      "part": "blocks",
+      "description": "索引记录每块的文件偏移、存储大小、原始大小、编码方法和原始数据 SHA-256；各块紧密连续"
+    },
+    {
+      "part": "index",
+      "encoding": "zlib 压缩的 UTF-8 JSON",
+      "maximum_decoded_bytes": 67108864
+    },
+    {
+      "part": "footer",
+      "struct": "<8sQQ32s",
+      "magic": "CEINDEX1",
+      "fields": [
+        "magic",
+        "index_offset",
+        "index_stored_size",
+        "index_stored_sha256"
+      ]
+    }
+  ],
+  "index_fields": {
+    "version": "格式版本",
+    "dictionary": "LZMA2 字典大小，最大 128 MiB",
+    "chunk_size": "去重数据片段的最大大小；片段实际边界和长度由 chunks 记录，解码不依赖切块算法",
+    "chunker": "编码器的切块方式，仅作记录；zero-anchor-v1 在至少 64 KiB 后寻找双零内容边界，找不到则使用最大大小",
+    "files": "原相对路径、内容对象编号、修改时间",
+    "directories": "包含空目录的相对路径列表",
+    "objects": "原文件大小及 SHA-256、转换方式、转换后大小及 SHA-256、数据片段编号；PNG 对象还记录 png_pixels，用于限制每次解码的图片总像素",
+    "chunks": "片段大小、SHA-256、所属数据块及块内偏移；所属块为 null 表示全部为零",
+    "blocks": "数据块描述列表",
+    "object_order": "完整且无重复的对象还原顺序，用于减少重复解码",
+    "png_codec": "版本 2 必须为 packpng-2-tcip-1"
+  },
+  "block_codecs": {
+    "copy": "原样存储",
+    "lzma2": "原始 LZMA2 数据流，使用索引中的字典大小",
+    "lzma2-x86": "x86 BCJ 变换后编码的原始 LZMA2 数据流"
+  },
+  "object_transforms": {
+    "none": "原始文件字节",
+    "jpeg-xl": "包含原 JPEG 重建信息的 JPEG XL；编码时必须验证能恢复原始 JPEG，解码时强制重建并核对原文件大小及 SHA-256",
+    "png-pack": "packPNG 2 的 TCIP v1；内嵌文件名固定为 image_加八位对象编号.png；解码前检查魔数、版本、文件名、长度，批量还原后逐文件核对原大小和 SHA-256。原文件名、目录和修改时间由外层索引恢复"
+  },
+  "limits": {
+    "block_bytes": 134217728,
+    "files_and_directories": 500000,
+    "objects": 500000,
+    "chunks": 500000,
+    "jpeg_original_bytes": 134217728,
+    "png_original_bytes": 134217728,
+    "png_pixels_exclusive_maximum": 33554432,
+    "png_batch_pixels": 268435456,
+    "png_batch_files": 256,
+    "png_process_memory_bytes": 8589934592,
+    "png_batch_seconds": 120,
+    "png_parallel_pixel_budget": 134217728
+  },
+  "restoration": [
+    "拒绝绝对路径、上级目录、Windows 保留名称、大小写冲突及文件与目录路径冲突",
+    "逐数据块、片段和文件核对大小及 SHA-256",
+    "重复文件恢复为独立副本",
+    "所有内容在项目 tmp 中完整还原后才将目录交付到目标位置",
+    "现有输出不会被覆盖，来源游戏和冷藏包不会被自动删除",
+    "PNG 工具写入临时文件并重命名时，监控跳过刚消失的临时文件；按批次内最大图片的像素总量限制实际并行数"
+  ],
+  "readable_versions": [
+    1,
+    2
+  ],
+  "png_tools": {
+    "version": "2.0l",
+    "release": "https://github.com/YadeWira/packPNG/releases/tag/v2.0l",
+    "windows_executable": "https://github.com/YadeWira/packPNG/releases/download/v2.0l/packPNG_win_x64.exe",
+    "sha256": "838e9c1b35ed34b5b0f0c98a1ba2acb88dc5522bb2bee3821743c39b09ebecf0",
+    "local_directory": "codecs",
+    "setup": "python packaging/fetch_cold_codecs.py"
+  },
+  "compression_profiles": {
+    "compact": "LZMA2 normal，nice_len=273，默认搜索深度；不使用块取样和 PNG 像素密度筛选",
+    "balanced": "LZMA2 fast / HC4，nice_len=64，搜索深度 32；大块从开头、中部、末尾取样，预计收益不足 0.5% 时原样存储；PNG 原大小低于像素数的 1/100 时使用普通压缩",
+    "fast": "LZMA2 fast / HC4，nice_len=32，搜索深度 16；普通大块取样收益不足 1%、已转换图片块不足 5% 时原样存储；PNG 原大小低于像素数的 1/50 时使用普通压缩",
+    "dictionary": "编码字典不超过当前独立块所需的最小二次幂容量；索引中的 dictionary 是所有块解码的上限，解码无需知道编码档位"
+  }
+}

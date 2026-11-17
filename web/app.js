@@ -29,6 +29,7 @@ const ICONS = {
   phone: '<svg viewBox="0 0 24 24"><rect x="6" y="2" width="12" height="20" rx="2"/><path d="M11 18h2"/></svg>',
   clock: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
   close: '<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>',
+  lock: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>',
 };
 
 const ANDROID_HELP = {
@@ -39,6 +40,7 @@ const ANDROID_HELP = {
 
 const state = {
   games: [],
+  groups: [],
   statuses: [],
   statusFilter: '全部',
   sort: localGet('sort') || 'added',
@@ -46,6 +48,9 @@ const state = {
   collapsed: new Set(JSON.parse(localGet('collapsed') || '[]')),
   route: { page: 'home' },
   lastJson: '',
+  loadRequest: 0,
+  appliedLoad: 0,
+  visibilityVersion: 0,
   artKey: '',
   bust: {},        // 图片换过后加个版本号，让窗口重新读图
   pick: null,      // 正在选图片：{ id, kind }
@@ -145,6 +150,7 @@ const gradient = g => {
     : `linear-gradient(160deg,hsl(${h} 40% 34%),hsl(${(h + 50) % 360} 45% 16%))`;
 };
 const game = id => state.games.find(g => g.id === id);
+const group = id => state.groups.find(g => g.id === id);
 const genres = g => (g.genres ? g.genres.split('、') : []);
 
 // ---------------------------------------------------------------- 图片
@@ -205,24 +211,43 @@ function thumbHtml(g) {
   return `<span class="thumb letter" style="background:${gradient(g)}">${firstLetter(g)}</span>`;
 }
 
+function sideGameHtml(g, activeId) {
+  return `
+    <a data-gid="${g.id}" class="side-item ${g.id === activeId ? 'active' : ''} ${isRunning(g) ? 'running' : ''} ${g.missing ? 'missing' : ''}" href="#/game/${g.id}" title="${esc(g.name)}">
+      ${thumbHtml(g)}<span class="label">${esc(g.name)}</span>${isRunning(g) ? '<span class="tag live">运行中</span>' : g.platform !== 'PC' ? `<span class="tag">${esc(g.platform)}</span>` : ''}
+    </a>`;
+}
+
 function renderSidebar() {
   const list = state.games.filter(matches).sort(compareGames);
   const activeId = state.route.page === 'game' ? state.route.id : null;
   let html = `<a class="side-home ${state.route.page === 'home' ? 'active' : ''}" href="#/">${ICONS.home}<span>全部游戏</span></a>`;
+  for (const g of state.groups) {
+    const key = `custom-${g.id}`;
+    const items = list.filter(item => item.group_id === g.id);
+    const collapsed = state.collapsed.has(key);
+    const active = state.route.page === 'group' && state.route.id === g.id;
+    const label = esc(g.name + (g.hidden ? '（隐藏分组）' : ''));
+    html += `<div class="group-head custom-group-head">
+      <button type="button" class="group-fold ${collapsed ? 'collapsed' : ''}" data-group="${key}" aria-label="${collapsed ? '展开' : '收起'}${label}" aria-expanded="${!collapsed}" ${items.length ? '' : 'disabled'}>${ICONS.chevron}</button>
+      <a class="group-link ${active ? 'active' : ''}" href="#/group/${g.id}" title="${label}" ${active ? 'aria-current="page"' : ''}>
+        <span class="label">${esc(g.name)}</span>${g.hidden ? ICONS.lock : ''}<span class="n">${items.length}</span>
+      </a>
+    </div>`;
+    if (!collapsed) html += items.map(item => sideGameHtml(item, activeId)).join('');
+  }
   for (const status of ['愿望单', ...GROUP_ORDER, '安卓']) {
-    const items = list.filter(g => status === '愿望单' ? g.is_wishlist
-      : !g.is_wishlist && (status === '安卓' ? g.platform === '安卓' : g.platform !== '安卓' && g.status === status));
+    const items = list.filter(g => g.group_id == null && (status === '愿望单' ? g.is_wishlist
+      : !g.is_wishlist && (status === '安卓' ? g.platform === '安卓' : g.platform !== '安卓' && g.status === status)));
     if (!items.length) continue;
     const collapsed = state.collapsed.has(status);
     html += `<button class="group-head ${collapsed ? 'collapsed' : ''}" data-group="${status}" aria-expanded="${!collapsed}">${ICONS.chevron}${status}<span class="n">${items.length}</span></button>`;
     if (collapsed) continue;
-    html += items.map(g => `
-      <a data-gid="${g.id}" class="side-item ${g.id === activeId ? 'active' : ''} ${isRunning(g) ? 'running' : ''} ${g.missing ? 'missing' : ''}" href="#/game/${g.id}" title="${esc(g.name)}">
-        ${thumbHtml(g)}<span class="label">${esc(g.name)}</span>${isRunning(g) ? '<span class="tag live">运行中</span>' : g.platform !== 'PC' ? `<span class="tag">${esc(g.platform)}</span>` : ''}
-      </a>`).join('');
+    html += items.map(g => sideGameHtml(g, activeId)).join('');
   }
   if (!list.length) html += `<div class="side-empty">${state.games.length ? '没有搜到' : '还没有游戏'}</div>`;
   $('#side-list').innerHTML = html;
+  $('#lock-groups').hidden = !state.groups.some(g => g.hidden);
 }
 
 // ---------------------------------------------------------------- 顶栏
@@ -328,6 +353,22 @@ function renderHome() {
       </div>
       ${wall.length ? `<div class="wall">${wall.map(tileHtml).join('')}</div>` : `<div class="empty-state"><p>${wishPage ? '先搜名字、保存资料，想玩的时候再下载。' : '没有符合条件的游戏'}</p></div>`}
     </div>`;
+  view.scrollTop = scroll;
+}
+
+function renderGroup(id) {
+  const g = group(id);
+  if (!g) {
+    view.innerHTML = '<div class="home"><div class="empty-state"><h2>找不到这个分组</h2><p><a href="#/" class="link">回到主页</a></p></div></div>';
+    return;
+  }
+  const items = state.games.filter(item => item.group_id === id && matches(item)).sort(compareGames);
+  const scroll = view.scrollTop;
+  view.innerHTML = `<div class="home">
+    <div class="shelf-head"><h2 class="group-wall-title">${esc(g.name)}</h2>${g.hidden ? ICONS.lock : ''}<span class="n">${items.length}</span></div>
+    ${items.length ? `<div class="wall">${items.map(tileHtml).join('')}</div>`
+      : `<div class="empty-state"><p>${state.q ? '组里没有符合条件的游戏' : '在游戏上点右键，选择「移到分组」。'}</p></div>`}
+  </div>`;
   view.scrollTop = scroll;
 }
 
@@ -496,6 +537,9 @@ function renderGame(id) {
             <div class="field"><span class="k">状态</span>
               <div class="segmented">${state.statuses.map(s => `<button data-status="${s}" class="${s === g.status ? 'active' : ''}">${s}</button>`).join('')}</div>
             </div>
+            ${g.is_wishlist ? '' : `<div class="field"><span class="k">分组</span>
+              <button type="button" class="btn group-choice" data-move-group aria-label="移到分组">${ICONS.folder}<span>${esc(group(g.group_id)?.name || '默认分组')}</span></button>
+            </div>`}
             <div class="field"><span class="k">评分</span>
               <div class="stars">${[1, 2, 3, 4, 5].map(n => `<button data-rate="${n}" class="${n <= g.rating ? 'on' : ''}" title="${n} 星">${ICONS.star}</button>`).join('')}</div>
             </div>
@@ -553,7 +597,7 @@ function renderGame(id) {
 }
 
 // 资料或图片变了（比如后台刚找到资料）才需要整页重画
-const artKey = g => [g.name, g.cover, g.hero, g.logo, g.description, g.meta_id, g.scraping, g.is_wishlist, g.wish_version, g.latest_version, g.version_status, g.version_checked_at, g.screenshots.length, state.bust[g.id]].join('|');
+const artKey = g => [g.name, g.cover, g.hero, g.logo, g.description, g.meta_id, g.scraping, g.is_wishlist, g.wish_version, g.latest_version, g.version_status, g.version_checked_at, g.screenshots.length, g.group_id, group(g.group_id)?.name, state.bust[g.id]].join('|');
 
 function updateGameLive() {
   const g = game(state.route.id);
@@ -919,6 +963,183 @@ async function deleteGame(id) {
   }
 }
 
+// ---------------------------------------------------------------- 自定义分组
+const groupManager = $('#group-manager');
+const groupEditor = $('#group-editor');
+const groupSave = $('#group-save');
+let groupSubmit = null;
+let returnToGroupManager = false;
+
+function renderGroupManager() {
+  if (!groupManager.open) return;
+  $('#group-list').innerHTML = state.groups.length ? state.groups.map(g => `
+    <li>
+      <a href="#/group/${g.id}" title="${esc(g.name)}">${esc(g.name)}${g.hidden ? ' <span class="hidden-label">（隐藏）</span>' : ''}</a>
+      <button type="button" class="btn" data-rename-group="${g.id}" aria-label="重命名${esc(g.name)}">重命名</button>
+      <button type="button" class="icon-btn" data-delete-group="${g.id}" aria-label="删除分组${esc(g.name)}" title="删除分组">${ICONS.trash}</button>
+    </li>`).join('') : '<li>暂无分组</li>';
+}
+
+function openGroupManager() {
+  groupManager.showModal();
+  renderGroupManager();
+}
+
+function openGroupForm(title, action, fields, submit) {
+  returnToGroupManager = groupManager.open;
+  if (returnToGroupManager) groupManager.close();
+  groupSubmit = submit;
+  $('#group-editor-title').textContent = title;
+  $('#group-fields').innerHTML = fields;
+  $('#group-error').hidden = true;
+  groupSave.textContent = action;
+  groupEditor.showModal();
+  $('#group-fields input, #group-fields select').focus();
+}
+
+function groupPasswordInput(name, label, autocomplete) {
+  return `<label class="field"><span class="k">${label}</span>
+    <input type="password" name="${name}" required maxlength="128" autocomplete="${autocomplete}">
+  </label>`;
+}
+
+function editGroup(g = null) {
+  const nameField = `<label class="field"><span class="k">分组名称</span>
+    <input type="text" name="name" required maxlength="48" value="${esc(g?.name)}">
+  </label>`;
+  const hiddenFields = `<label class="group-check"><input type="checkbox" name="hidden">隐藏分组</label>
+    <fieldset class="group-passwords" id="group-passwords" hidden disabled>
+      ${groupPasswordInput('password', '密码', 'new-password')}
+      ${groupPasswordInput('confirm_password', '确认密码', 'new-password')}
+    </fieldset>`;
+  openGroupForm(g ? '重命名分组' : '新建分组', g ? '保存' : '创建', nameField + (g ? '' : hiddenFields), async fields => {
+    const name = fields.get('name');
+    if (g) {
+      await api('PATCH', `/api/groups/${g.id}`, { name });
+    } else {
+      const hidden = fields.has('hidden');
+      const password = fields.get('password');
+      if (hidden && password !== fields.get('confirm_password')) throw new Error('两次输入的密码不一样');
+      await api('POST', '/api/groups', { name, hidden, password: hidden ? password : undefined });
+    }
+    await load(true);
+    toast(g ? '分组已重命名' : '分组已创建');
+  });
+}
+
+function openUnlockGroups() {
+  openGroupForm('解锁隐藏分组', '解锁', groupPasswordInput('password', '密码', 'current-password'), async fields => {
+    await api('POST', '/api/groups/unlock', { password: fields.get('password') });
+    await load(true);
+    void pollImports(true);
+  });
+}
+
+function openMoveGroup(id) {
+  const g = game(id);
+  if (!g || g.is_wishlist) return;
+  if (!state.groups.length) return openGroupManager();
+  const options = state.groups.map(item =>
+    `<option value="${item.id}" ${g.group_id === item.id ? 'selected' : ''}>${esc(item.name)}${item.hidden ? '（隐藏）' : ''}</option>`
+  ).join('');
+  openGroupForm('移到分组', '保存', `<label class="field"><span class="k">分组</span>
+    <select name="group_id"><option value="">默认分组</option>${options}</select>
+  </label>`, async fields => {
+    const value = fields.get('group_id');
+    await api('PUT', `/api/games/${id}/group`, { group_id: value ? Number(value) : null });
+    await load(true);
+    toast('分组已更新');
+  });
+}
+
+async function deleteGroup(id) {
+  const g = group(id);
+  if (!g || !await ask(`删除分组「${g.name}」？`, '组里的游戏会回到默认分组，游戏文件和游玩记录会保留。', '删除分组')) return;
+  try {
+    await api('DELETE', `/api/groups/${id}`);
+    await load(true);
+    toast('分组已删除');
+  } catch (e) { toast(e.message, true); }
+}
+
+function hideLockedGroups() {
+  state.appliedLoad = ++state.loadRequest;
+  const hidden = new Set(state.groups.filter(g => g.hidden).map(g => g.id));
+  if (!hidden.size) return;
+  state.lastJson = '';
+  applyLibrary({
+    games: state.games.filter(g => !hidden.has(g.group_id)),
+    groups: state.groups.filter(g => !g.hidden),
+    statuses: state.statuses,
+  }, true);
+}
+window.hideLockedGroups = hideLockedGroups;
+
+groupManager.addEventListener('click', e => {
+  const target = e.target.closest('a, button');
+  if (!target) return;
+  if (target.matches('a, [data-close]')) return groupManager.close();
+  if (target.hasAttribute('data-create-group')) return editGroup();
+  if (target.hasAttribute('data-unlock-groups')) return openUnlockGroups();
+  if (target.dataset.renameGroup) return editGroup(group(Number(target.dataset.renameGroup)));
+  if (target.dataset.deleteGroup) return deleteGroup(Number(target.dataset.deleteGroup));
+});
+groupManager.addEventListener('close', () => {
+  if (!groupManager.open) $('#group-list').replaceChildren();
+});
+groupEditor.addEventListener('click', e => {
+  if (e.target.closest('[data-close]')) groupEditor.close();
+});
+groupEditor.addEventListener('cancel', e => {
+  if (groupSave.disabled) e.preventDefault();
+});
+groupEditor.addEventListener('close', () => {
+  $('#group-fields').replaceChildren();
+  groupSubmit = null;
+  if (returnToGroupManager) {
+    returnToGroupManager = false;
+    openGroupManager();
+  }
+});
+$('#group-form').addEventListener('change', e => {
+  if (e.target.name !== 'hidden') return;
+  const fields = $('#group-passwords');
+  fields.hidden = fields.disabled = !e.target.checked;
+});
+$('#group-form').addEventListener('input', () => { $('#group-error').hidden = true; });
+$('#group-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  if (!groupSubmit || groupSave.disabled) return;
+  const error = $('#group-error');
+  const cancel = $('[data-close]', groupEditor);
+  error.hidden = true;
+  groupSave.disabled = cancel.disabled = true;
+  try {
+    await groupSubmit(new FormData(e.currentTarget));
+    groupEditor.close();
+  } catch (e) {
+    error.textContent = e.message;
+    error.hidden = false;
+  } finally {
+    groupSave.disabled = cancel.disabled = false;
+  }
+});
+$('#manage-groups').addEventListener('click', openGroupManager);
+$('#lock-groups').addEventListener('click', async e => {
+  e.currentTarget.disabled = true;
+  try {
+    await api('POST', '/api/groups/lock');
+    hideLockedGroups();
+    await load(true);
+    toast('隐藏分组已锁定');
+    $('#manage-groups').focus();
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    $('#lock-groups').disabled = false;
+  }
+});
+
 // ---------------------------------------------------------------- 右键菜单
 function menuItems(g) {
   if (g.is_wishlist) return [
@@ -932,6 +1153,7 @@ function menuItems(g) {
     { label: '查看详情', run: () => { location.hash = `#/game/${g.id}`; } },
     '-',
     { label: '标记为', sub: state.statuses.map(s => ({ label: s, checked: g.status === s, run: () => setStatus(g.id, s) })) },
+    { label: '移到分组…', run: () => openMoveGroup(g.id) },
     { label: '管理', sub: [
       { label: '匹配资料…', run: () => openMatch(g.id) },
       { label: '自动获取资料', disabled: g.scraping, run: () => rescrape(g.id) },
@@ -1109,13 +1331,14 @@ function showShot() {
 
 // ---------------------------------------------------------------- 路由与刷新
 function parseRoute() {
-  const m = location.hash.match(/^#\/game\/(\d+)/);
-  if (m) state.route = { page: 'game', id: +m[1] };
+  const m = location.hash.match(/^#\/(game|group)\/(\d+)$/);
+  if (m) state.route = { page: m[1], id: +m[2] };
   else state.route = { page: location.hash === '#/settings' ? 'settings' : location.hash === '#/wishlist' ? 'wishlist' : 'home' };
 }
 
 function renderView() {
   if (state.route.page === 'game') renderGame(state.route.id);
+  else if (state.route.page === 'group') renderGroup(state.route.id);
   else if (state.route.page === 'settings') renderSettings();
   else renderHome();
 }
@@ -1125,23 +1348,64 @@ function renderAll(full) {
   renderSidebar();
   // 设置页只在整页刷新时画一次，定时刷新游戏列表时不重画，免得冲掉正在改的选项
   if (state.route.page === 'settings') return full && renderView();
-  if (full || ['home', 'wishlist'].includes(state.route.page)) return renderView();
+  if (full || state.route.page !== 'game') return renderView();
   // 游戏页面：资料变了且没在打字时整页重画，否则只更新时长、按钮这些会变的地方
   const g = game(state.route.id);
   const typing = document.activeElement && document.activeElement.matches('#view input, #view textarea');
-  if (g && artKey(g) !== state.artKey && !typing) renderGame(g.id);
+  if (!g || (artKey(g) !== state.artKey && !typing)) renderView();
   else updateGameLive();
 }
 
+function clearLockedGroupViews() {
+  state.visibilityVersion++;
+  closeMenu();
+  state.matchId = state.pick = null;
+  state.matchResults = [];
+  $('#match-q').value = '';
+  $('#search').value = state.q = '';
+  $('#viewer-img').removeAttribute('src');
+  for (const id of ['match', 'wish-attach', 'viewer', 'group-editor', 'confirm', 'refresh-dialog']) {
+    if (document.getElementById(id).open) document.getElementById(id).close();
+  }
+  for (const id of ['match-results', 'wish-local', 'ctx', 'confirm-title', 'confirm-text', 'refresh-results', 'refresh-message', 'toast']) {
+    document.getElementById(id).replaceChildren();
+  }
+  $('#toast').classList.remove('show');
+  imp.jobs = [];
+  if (imp.phase === 'jobs' && $('#import').open) renderImport();
+  renderImportButton();
+  void pollImports(true);
+  void pollRefresh(true);
+}
+
+function applyLibrary(data, full) {
+  const { page, id } = state.route;
+  const previous = page === 'game' ? game(id) : page === 'group' ? group(id) : null;
+  const hiddenLocked = state.groups.some(g => g.hidden && !data.groups.some(item => item.id === g.id));
+  const groupsChanged = JSON.stringify(state.groups) !== JSON.stringify(data.groups);
+  state.games = data.games;
+  state.groups = data.groups;
+  state.statuses = data.statuses;
+  if (hiddenLocked) clearLockedGroupViews();
+  if (state.ctx && !game(state.ctx.id)) closeMenu();
+  if (previous && !(page === 'game' ? game(id) : group(id))) {
+    history.replaceState(history.state, '', '#/');
+    parseRoute();
+  }
+  if (groupsChanged) renderGroupManager();
+  renderAll(full);
+}
+
 async function load(full = false) {
+  const order = ++state.loadRequest;
   try {
     const data = await api('GET', '/api/games');
+    if (order < state.appliedLoad) return;
+    state.appliedLoad = order;
     const json = JSON.stringify(data);
     if (!full && json === state.lastJson) return;
     state.lastJson = json;
-    state.games = data.games;
-    state.statuses = data.statuses;
-    renderAll(full);
+    applyLibrary(data, full);
   } catch (e) {
     toast(e.message, true);
   }
@@ -1160,7 +1424,9 @@ async function launch(id) {
 async function saveField(id, field, value) {
   try {
     await api('PATCH', `/api/games/${id}`, { [field]: value });
-    Object.assign(game(id), { [field]: value });
+    const g = game(id);
+    if (!g) return;
+    Object.assign(g, { [field]: value });
     state.lastJson = '';
     renderTopbar();
     renderSidebar();
@@ -1230,9 +1496,14 @@ async function pollRefresh(quiet = false) {
   clearTimeout(refreshing.timer);
   if (refreshing.polling) return;
   refreshing.polling = true;
+  const visibility = state.visibilityVersion;
   try {
     const previous = refreshing.job;
     const job = await api('GET', '/api/refresh');
+    if (visibility !== state.visibilityVersion) {
+      refreshing.timer = setTimeout(pollRefresh, 0);
+      return;
+    }
     // 页面刚打开时的旧查询可能晚于点击刷新返回，不能把新任务盖回旧状态。
     if (refreshing.job && job.id < refreshing.job.id) {
       refreshing.timer = setTimeout(pollRefresh, 1000);
@@ -1442,9 +1713,11 @@ function renderImportButton() {
 
 async function pollImports(quiet = false) {
   clearTimeout(imp.timer);
+  const visibility = state.visibilityVersion;
   let jobs;
   try {
     ({ jobs } = await api('GET', '/api/import/jobs'));
+    if (visibility !== state.visibilityVersion) return;
   } catch {
     imp.timer = setTimeout(pollImports, 3000);
     return;
@@ -1529,12 +1802,14 @@ $('#side-list').addEventListener('click', e => {
   state.collapsed.has(s) ? state.collapsed.delete(s) : state.collapsed.add(s);
   localSet('collapsed', JSON.stringify([...state.collapsed]));
   renderSidebar();
+  $(`[data-group="${CSS.escape(s)}"]`, e.currentTarget)?.focus({ preventScroll: true });
 });
 
 $('#search').addEventListener('input', e => {
   state.q = e.target.value;
   renderSidebar();
   if (['home', 'wishlist'].includes(state.route.page)) renderHome();
+  if (state.route.page === 'group') renderGroup(state.route.id);
 });
 $('#sort').value = Object.prototype.hasOwnProperty.call(SORTS, state.sort) ? state.sort : 'added';
 state.sort = $('#sort').value;
@@ -1543,6 +1818,7 @@ $('#sort').addEventListener('change', e => {
   localSet('sort', state.sort);
   renderSidebar();
   if (['home', 'wishlist'].includes(state.route.page)) renderHome();
+  if (state.route.page === 'group') renderGroup(state.route.id);
 });
 
 $('#now-playing').addEventListener('click', e => {
@@ -1581,6 +1857,7 @@ view.addEventListener('click', async e => {
     return;
   }
   const id = state.route.id;
+  if (t.hasAttribute('data-move-group')) return openMoveGroup(id);
   if (t.hasAttribute('data-back')) return history.length > 1 ? history.back() : (location.hash = '#/');
   if (t.dataset.status) return setStatus(id, t.dataset.status);
   if (t.hasAttribute('data-open-android')) return api('POST', '/api/open-android-dir').catch(err => toast(err.message, true));

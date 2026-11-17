@@ -58,6 +58,10 @@
           <option value="size">占用空间</option>
         </select>
       </div>
+      <div class="side-group-tools">
+        <button type="button" id="manage-groups" class="btn">管理分组</button>
+        <button type="button" id="lock-groups" class="btn" hidden>锁定隐藏分组</button>
+      </div>
       <nav id="side-list" class="side-list" aria-label="游戏列表"></nav>
       <div class="side-foot">
         <div id="import-menu" class="import-menu" role="menu" hidden>
@@ -99,6 +103,31 @@
       <div class="dialog-btns">
         <button value="cancel" class="btn">取消</button>
         <button value="ok" id="confirm-ok" class="btn btn-confirm"></button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- 分组弹窗沿用现有按钮和输入框样式，主操作放在右下角。 -->
+  <dialog id="group-manager" class="dialog group-dialog" aria-labelledby="group-manager-title">
+    <div class="group-dialog-body">
+      <h2 id="group-manager-title">管理分组</h2>
+      <ul id="group-list" class="group-list" aria-label="自定义分组"></ul>
+      <div class="dialog-btns group-actions">
+        <button type="button" class="link" data-unlock-groups>解锁隐藏分组</button>
+        <button type="button" class="btn" data-close>关闭</button>
+        <button type="button" class="btn btn-primary" data-create-group>新建分组</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="group-editor" class="dialog group-dialog" aria-labelledby="group-editor-title">
+    <form id="group-form" autocomplete="off">
+      <h2 id="group-editor-title"></h2>
+      <div id="group-fields" class="group-fields"></div>
+      <p id="group-error" class="group-error" role="alert" hidden></p>
+      <div class="dialog-btns">
+        <button type="button" class="btn" data-close>取消</button>
+        <button type="submit" class="btn btn-primary" id="group-save"></button>
       </div>
     </form>
   </dialog>

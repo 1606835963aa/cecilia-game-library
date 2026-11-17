@@ -1,4 +1,6 @@
 """分卷识别、临时名称和原包保留检查，所有样例都在项目 tmp 内生成。"""
+import hashlib
+import hmac
 import os
 import struct
 import tempfile
@@ -51,6 +53,35 @@ def make_rar_volumes(folder):
     return paths, content
 
 
+def make_aes_zip(path, content, password=b"example-password", method=0, version=2, packed=None):
+    """生成可由 7-Zip 校验的 AES ZIP，便于单独破坏密文、校验码或压缩流。"""
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    if packed is None:
+        compressor = zlib.compressobj(wbits=-15)
+        packed = compressor.compress(content) + compressor.flush() if method == 8 else content
+    salt = b"0123456789abcdef"
+    keys = hashlib.pbkdf2_hmac("sha1", password, salt, 1000, 66)
+    cipher = Cipher(algorithms.AES(keys[:32]), modes.ECB()).encryptor()
+    counters = b"".join(i.to_bytes(16, "little") for i in range(1, (len(packed) + 15) // 16 + 1))
+    stream = cipher.update(counters) + cipher.finalize()
+    encrypted = bytes(a ^ b for a, b in zip(packed, stream))
+    payload = salt + keys[64:] + encrypted + hmac.digest(keys[32:64], encrypted, "sha1")[:10]
+    info = zipfile.ZipInfo("SummerMemories/readme.txt")
+    info.extra = struct.pack("<HHH2sBH", 0x9901, 7, version, b"AE", 3, method)
+    with zipfile.ZipFile(path, "w") as output:
+        output.writestr(info, payload)
+        central = output.start_dir
+    data = bytearray(path.read_bytes())
+    crc = zlib.crc32(content) if version == 1 else 0
+    for offset, value in ((6, 1), (8, 99), (central + 8, 1), (central + 10, 99)):
+        struct.pack_into("<H", data, offset, value)
+    for offset, value in ((14, crc), (22, len(content)), (central + 16, crc), (central + 24, len(content))):
+        struct.pack_into("<I", data, offset, value)
+    path.write_bytes(data)
+    return 30 + len(info.filename.encode()) + len(info.extra)
+
+
 class ArchiveTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -89,6 +120,260 @@ class ArchiveTests(unittest.TestCase):
 
     def parts(self):
         return make_rar_volumes(self.downloads)[0]
+
+    def config(self, delete=False):
+        return {"games_dir": str(self.root / "games"), "download_dirs": [str(self.downloads)],
+                "android_dir": str(self.root / "android"), "delete_archive": delete, "nested_depth": 3}
+
+    def require_seven(self):
+        if not self.seven:
+            self.skipTest("本机没有 7-Zip")
+
+    def write_zip(self, path, content):
+        modified = path.stat().st_mtime_ns if path.exists() else 0
+        with zipfile.ZipFile(path, "w") as output:
+            output.writestr("SummerMemories/readme.txt", content)
+        if modified:
+            os.utime(path, ns=(modified + 2_000_000_000, modified + 2_000_000_000))
+
+    def test_corrupt_aes_archive_is_not_published_or_deleted(self):
+        self.require_seven()
+        path = self.downloads / "Example.zip"
+        for damaged_part in ("data", "mac"):
+            with self.subTest(damaged_part=damaged_part):
+                offset = make_aes_zip(path, b"Example content" * 64)
+                data = bytearray(path.read_bytes())
+                damaged_offset = offset + 18 if damaged_part == "data" else offset + 18 + 15 * 64
+                data[damaged_offset] ^= 1
+                path.write_bytes(data)
+                state = {}
+                config = dict(self.config(delete=True), passwords=["example-password"])
+                report = extract._scan_once(config, self.seven, state, {}, {}, force=True)
+                self.assertEqual(report["failed"], 1)
+                self.assertEqual(report["succeeded"], 0)
+                self.assertEqual(path.read_bytes(), data)
+                self.assertEqual(state, {})
+                self.assertFalse(list((self.root / "games").glob("Game_*")))
+
+    def test_chinese_password_aes_zip_is_deleted_only_after_success(self):
+        self.require_seven()
+        content = b"Example content" * 64
+        password = "示例密码"
+        for method in (0, 8):
+            with self.subTest(method=method):
+                path = self.downloads / f"Example{method}.zip"
+                make_aes_zip(path, content, password.encode("gbk"), method=method)
+                config = dict(self.config(delete=True), passwords=[password])
+                report = extract._scan_once(config, self.seven, {}, {}, {}, force=True)
+                self.assertEqual(report["succeeded"], 1)
+                self.assertFalse(path.exists())
+        outputs = list((self.root / "games").glob("Game_*/readme.txt"))
+        self.assertEqual(len(outputs), 2)
+        self.assertTrue(all(output.read_bytes() == content for output in outputs))
+
+    def test_aes_formats_match_real_7zip(self):
+        self.require_seven()
+        content = b"Example content" * 64
+        path = self.downloads / "Example.zip"
+        for version in (1, 2):
+            for method in (0, 8):
+                with self.subTest(version=version, method=method):
+                    make_aes_zip(path, content, method=method, version=version)
+                    code, report = extract.run_7z(self.seven, ["t", "-pexample-password", str(path)])
+                    self.assertEqual(code, 0, report)
+                    target = self.root / f"decoded-{version}-{method}"
+                    extract.extract_zip_with_python(path, b"example-password", target)
+                    self.assertEqual((target / "SummerMemories/readme.txt").read_bytes(), content)
+
+    def test_python_fallback_reads_real_7zip_aes_output(self):
+        self.require_seven()
+        content = b"Example content" * 1024
+        source = self.root / "readme.txt"
+        source.write_bytes(content)
+        path = self.downloads / "Example.zip"
+        code, report = extract.run_7z(self.seven, ["a", "-tzip", "-mem=AES256", "-pexample-password", str(path), str(source)])
+        self.assertEqual(code, 0, report)
+        target = self.root / "decoded"
+        extract.extract_zip_with_python(path, b"example-password", target)
+        self.assertEqual((target / "readme.txt").read_bytes(), content)
+
+    def test_aes_missing_mac_and_bad_metadata_are_rejected(self):
+        path = self.downloads / "Example.zip"
+        content = b"Example content" * 64
+        for damage in ("missing_mac", "size", "crc", "compression", "unfinished_deflate"):
+            with self.subTest(damage=damage):
+                compressor = zlib.compressobj(wbits=-15)
+                packed = compressor.compress(content) + compressor.flush()
+                method = 12 if damage == "compression" else 8
+                offset = make_aes_zip(path, content, method=method, version=1,
+                                      packed=packed[:-1] if damage == "unfinished_deflate" else None)
+                with zipfile.ZipFile(path) as archive:
+                    info = archive.infolist()[0]
+                if damage == "missing_mac":
+                    with path.open("r+b") as output:
+                        output.truncate(offset + info.compress_size - 10)
+                elif damage == "size":
+                    info.file_size += 1
+                elif damage == "crc":
+                    info.CRC ^= 1
+                with self.assertRaises(ValueError):
+                    extract._decrypt_aes_entry(path, info, b"example-password", self.root / "decoded.txt")
+
+    def test_7zip_warning_keeps_original_archive(self):
+        path = self.downloads / "Example.zip"
+        self.write_zip(path, "example")
+        with patch.object(extract, "archive_is_android", return_value=False), \
+             patch.object(extract, "choose_password", return_value=(None, "", "无密码")), \
+             patch.object(extract, "extract_archive", return_value=(1, "部分文件未能解压")):
+            ok, message = extract.process_group(self.seven, extract.archive_group(path), self.config(delete=True), [], [self.downloads])
+        self.assertFalse(ok)
+        self.assertIn("解压失败", message)
+        self.assertTrue(path.exists())
+        self.assertFalse(list((self.root / "games").glob("Game_*")))
+
+    def test_corrupt_nested_aes_zip_keeps_outer_archive(self):
+        self.require_seven()
+        inner = self.root / "inner.zip"
+        offset = make_aes_zip(inner, b"Example content", "示例密码".encode("gbk"))
+        data = bytearray(inner.read_bytes())
+        data[offset + 18] ^= 1
+        outer = self.downloads / "Example.zip"
+        with zipfile.ZipFile(outer, "w") as archive:
+            archive.writestr("inner.zip", data)
+        before = outer.read_bytes()
+        ok, message = extract.process_group(self.seven, extract.archive_group(outer), self.config(delete=True), ["示例密码"], [self.downloads])
+        self.assertFalse(ok)
+        self.assertIn("原包已保留", message)
+        self.assertEqual(outer.read_bytes(), before)
+        self.assertFalse(list((self.root / "games").glob("Game_*")))
+
+    def test_unchanged_archive_is_skipped_but_same_size_replacement_is_processed(self):
+        self.require_seven()
+        path = self.downloads / "Example.zip"
+        self.write_zip(path, "version one")
+        first = extract._scan_once(self.config(), self.seven, {}, {}, {}, force=True)
+        self.assertEqual(first["succeeded"], 1)
+        state = extract.load_state()
+        repeated = extract._scan_once(self.config(), self.seven, state, {}, {}, force=True)
+        self.assertEqual(repeated["processed"], 0)
+        size = path.stat().st_size
+        self.write_zip(path, "version two")
+        self.assertEqual(path.stat().st_size, size)
+        changed = extract._scan_once(self.config(), self.seven, state, {}, {}, force=True)
+        self.assertEqual(changed["succeeded"], 1)
+        outputs = sorted(p.read_text() for p in (self.root / "games").glob("Game_*/readme.txt"))
+        self.assertEqual(outputs, ["version one", "version two"])
+
+    def test_same_size_and_timestamp_updates_are_processed(self):
+        self.require_seven()
+        path = self.downloads / "Example.zip"
+        self.write_zip(path, "version one")
+        before = path.stat()
+        self.assertEqual(extract._scan_once(self.config(), self.seven, {}, {}, {}, force=True)["succeeded"], 1)
+
+        replacement = self.root / "replacement.zip"
+        self.write_zip(replacement, "version two")
+        os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+        os.replace(replacement, path)
+        current = path.stat()
+        self.assertEqual((current.st_size, current.st_mtime_ns), (before.st_size, before.st_mtime_ns))
+        self.assertEqual(extract._scan_once(self.config(), self.seven, extract.load_state(), {}, {}, force=True)["succeeded"], 1)
+
+        self.write_zip(path, "version six")
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        rewritten = path.stat()
+        self.assertEqual((rewritten.st_size, rewritten.st_mtime_ns), (before.st_size, before.st_mtime_ns))
+        self.assertEqual(extract._scan_once(self.config(), self.seven, extract.load_state(), {}, {}, force=True)["succeeded"], 1)
+        outputs = sorted(p.read_text() for p in (self.root / "games").glob("Game_*/readme.txt"))
+        self.assertEqual(outputs, ["version one", "version six", "version two"])
+
+    def test_new_archive_replacing_old_one_before_cleanup_is_preserved(self):
+        self.require_seven()
+        path = self.downloads / "Example.zip"
+        replacement = self.root / "replacement.zip"
+        self.write_zip(path, "version one")
+        self.write_zip(replacement, "version two")
+        new_bytes = replacement.read_bytes()
+        before = path.stat()
+        os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+        publish = extract.publish_game
+
+        def replace_after_publish(*args, **kwargs):
+            published = publish(*args, **kwargs)
+            os.replace(replacement, path)
+            return published
+
+        with patch.object(extract, "publish_game", side_effect=replace_after_publish):
+            report = extract._scan_once(self.config(delete=True), self.seven, {}, {}, {}, force=True)
+        self.assertEqual(report["succeeded"], 1)
+        self.assertEqual(path.read_bytes(), new_bytes)
+        outputs = [p.read_text() for p in (self.root / "games").glob("Game_*/readme.txt")]
+        self.assertEqual(outputs, ["version one"])
+
+        report = extract._scan_once(self.config(delete=True), self.seven, extract.load_state(), {}, {}, force=True)
+        self.assertEqual(report["succeeded"], 1)
+        self.assertFalse(path.exists())
+        outputs = sorted(p.read_text() for p in (self.root / "games").glob("Game_*/readme.txt"))
+        self.assertEqual(outputs, ["version one", "version two"])
+
+    def test_change_to_later_volume_is_not_skipped(self):
+        self.require_seven()
+        paths = self.parts()
+        state = {}
+        first = extract._scan_once(self.config(), self.seven, state, {}, {}, force=True)
+        self.assertEqual(first["succeeded"], 1)
+        old_time = paths[1].stat().st_mtime_ns
+        os.utime(paths[1], ns=(old_time + 2_000_000_000, old_time + 2_000_000_000))
+        changed = extract._scan_once(self.config(), self.seven, state, {}, {}, force=True)
+        self.assertEqual(changed["succeeded"], 1)
+        self.assertEqual(len(list((self.root / "games").glob("Game_*"))), 2)
+
+    def test_legacy_state_is_preserved_then_tracks_changes(self):
+        self.require_seven()
+        path = self.downloads / "Example.zip"
+        self.write_zip(path, "version one")
+        state = {str(path): True}
+        report = extract._scan_once(self.config(), self.seven, state, {}, {}, force=True)
+        self.assertEqual(report["processed"], 0)
+        self.assertIsInstance(extract.load_state()[str(path)], list)
+        self.write_zip(path, "version two")
+        changed = extract._scan_once(self.config(), self.seven, extract.load_state(), {}, {}, force=True)
+        self.assertEqual(changed["succeeded"], 1)
+
+    def test_legacy_size_and_timestamp_record_is_upgraded(self):
+        path = self.downloads / "Example.zip"
+        self.write_zip(path, "example")
+        before = path.stat()
+        state = {str(path): [[path.as_posix(), before.st_size, before.st_mtime_ns]]}
+        report = extract._scan_once(self.config(), self.seven, state, {}, {}, force=True)
+        self.assertEqual(report["processed"], 0)
+        self.assertEqual(extract.load_state()[str(path)], extract.group_signature(extract.archive_group(path)))
+
+    def test_deleted_archive_does_not_leave_stale_in_memory_state(self):
+        self.require_seven()
+        path = self.downloads / "Example.zip"
+        state = {}
+        for _ in range(2):
+            self.write_zip(path, "example")
+            report = extract._scan_once(self.config(delete=True), self.seven, state, {}, {}, force=True)
+            self.assertEqual(report["succeeded"], 1)
+            self.assertEqual(state, {})
+            self.assertEqual(extract.load_state(), {})
+
+    def test_download_stability_includes_modification_time(self):
+        path = self.downloads / "Example.zip"
+        self.write_zip(path, "version one")
+        group = extract.archive_group(path)
+        seen = {}
+        with patch.object(extract.time, "time", return_value=100):
+            self.assertFalse(extract.group_ready(group, 8, seen))
+        with patch.object(extract.time, "time", return_value=110):
+            self.assertTrue(extract.group_ready(group, 8, seen))
+        self.write_zip(path, "version two")
+        with patch.object(extract.time, "time", return_value=110):
+            self.assertFalse(extract.group_ready(group, 8, seen))
+        path.unlink()
+        self.assertFalse(extract.group_ready(group, 8, seen))
 
     def test_encrypted_header_uses_known_password_and_cache_tracks_passwords(self):
         outputs = [(2, "Cannot open encrypted archive. Wrong password?"), (0, "Multivolume = +\nVolume Index = 0")]
@@ -189,6 +474,46 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(report, {"processed": 1, "succeeded": 1, "failed": 0, "waiting": 0})
         self.assertFalse(any(self.downloads.iterdir()))
         self.assertEqual(len(list((self.root / "games").glob("Game_*"))), 1)
+
+    def test_cleanup_of_mixed_rar_volumes_checks_all_parts_before_deleting(self):
+        self.require_seven()
+        paths = self.parts()
+        replacement = self.root / "replacement.rar"
+        replacement.write_bytes(paths[1].read_bytes())
+        publish = extract.publish_game
+
+        def replace_after_publish(*args, **kwargs):
+            published = publish(*args, **kwargs)
+            os.replace(replacement, paths[1])
+            return published
+
+        with patch.object(extract, "publish_game", side_effect=replace_after_publish):
+            report = extract._scan_once(self.config(delete=True), self.seven, {}, {}, {}, force=True)
+        self.assertEqual(report["succeeded"], 1)
+        self.assertTrue(all(path.is_file() for path in paths))
+
+        report = extract._scan_once(self.config(delete=True), self.seven, extract.load_state(), {}, {}, force=True)
+        self.assertEqual(report["succeeded"], 1)
+        self.assertFalse(any(path.exists() for path in paths))
+
+    def test_cleanup_cancels_deletion_if_a_later_volume_cannot_be_marked(self):
+        self.require_seven()
+        paths = self.parts()
+        mark = extract.mark_archive_for_deletion
+        marked = []
+
+        def fail_second_mark(fd, delete):
+            if delete and marked:
+                raise PermissionError("分卷暂时被占用")
+            mark(fd, delete)
+            if delete:
+                marked.append(fd)
+
+        with patch.object(extract, "mark_archive_for_deletion", side_effect=fail_second_mark):
+            report = extract._scan_once(self.config(delete=True), self.seven, {}, {}, {}, force=True)
+        self.assertEqual(report["succeeded"], 1)
+        self.assertEqual(len(marked), 1)
+        self.assertTrue(all(path.is_file() for path in paths))
 
     def test_real_7zip_reads_and_extracts_mixed_rar_volumes_once(self):
         if not self.seven:

@@ -80,7 +80,8 @@ def bind(wish_id, local_id):
             raise ValueError("这个游戏的本地文件已经不在了")
         if conn.execute("SELECT 1 FROM sessions WHERE game_id IN (?,?) AND ended_at IS NULL", (wish_id, local_id)).fetchone():
             raise ValueError("游戏正在运行，退出后再关联")
-        fields = {key: local[key] for key in ("path", "version", "platform", "engine", "exe", "exe_locked", "size_bytes", "suspicious", "ad_files", "status")}
+        fields = {key: local[key] for key in ("path", "version", "platform", "engine", "exe", "exe_locked", "size_bytes",
+                                              "suspicious", "ad_files", "status", "group_id")}
         fields.update(is_wishlist=0, missing=0)
 
         def adopt_image(name):

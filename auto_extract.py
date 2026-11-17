@@ -18,6 +18,7 @@
     python auto_extract.py --dir D:\下载 临时换监视目录
 """
 import argparse
+import ctypes
 import hashlib
 import hmac
 import json
@@ -28,10 +29,12 @@ import shutil
 import struct
 import subprocess
 import sys
+import threading
 import time
 import zipfile
 import zlib
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+from ctypes import wintypes
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
@@ -47,6 +50,7 @@ LOG_DIR = ROOT / "logs"
 WORK_DIR = ROOT / "data"  # 解压时的中转文件夹都放在这里
 SCAN_LOCK = ROOT / "data" / "extract.lock"
 EVENT_PREFIX = "__EXTRACT_EVENT__"
+_config_mutex = threading.Lock()
 
 DEFAULT_CONFIG = {
     "watch_dirs": ["games"],
@@ -132,13 +136,84 @@ def load_config():
     return cfg
 
 
+@contextmanager
+def config_lock():
+    """设置页、导入线程和独立进程共用文件锁，整个读取和保存过程不能交错。"""
+    with _config_mutex:
+        lock_path = CONFIG_PATH.parent / "data" / "config.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+b") as handle:
+            deadline = time.monotonic() + 10
+            while True:
+                handle.seek(0)
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("设置正在保存，请稍后重试")
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
 def save_config(updates):
-    """只改动给出的设置项，其余（比如密码）原样保留。"""
-    user = {}
-    if CONFIG_PATH.exists():
-        user = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
-    user.update(updates)
-    CONFIG_PATH.write_text(json.dumps(user, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    """合并给出的设置；列表增删用函数在锁内读取最新值。"""
+    with config_lock():
+        user = {}
+        if CONFIG_PATH.exists():
+            user = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+        if not isinstance(user, dict):
+            raise ValueError("设置文件格式不正确")
+        user.update(updates(dict(user)) if callable(updates) else updates)
+        # 先写完整再替换，读取设置的进程不会遇到只写了一半的 JSON。
+        folder = CONFIG_PATH.parent / "tmp"
+        created_folder = not folder.exists()
+        folder.mkdir(exist_ok=True)
+        temporary = folder / f"config-{uuid4().hex}.json"
+        try:
+            with temporary.open("x", encoding="utf-8") as output:
+                json.dump(user, output, ensure_ascii=False, indent=2)
+                output.write("\n")
+                output.flush()
+                os.fsync(output.fileno())
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    os.replace(temporary, CONFIG_PATH)
+                    break
+                except PermissionError:
+                    # Windows 上正在读设置的短暂文件占用不应让这次保存丢失。
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.05)
+        finally:
+            temporary.unlink(missing_ok=True)
+            if created_folder:
+                try:
+                    folder.rmdir()
+                except OSError:
+                    pass
+
+
+def add_password(password, reject_duplicate=False):
+    def updates(user):
+        passwords = [str(p) for p in user.get("passwords") or []]
+        if password in passwords:
+            if reject_duplicate:
+                raise ValueError("这个密码已经在列表里了")
+        else:
+            passwords.append(password)
+        return {"passwords": passwords}
+
+    save_config(updates)
+
+
+def remove_password(password):
+    save_config(lambda user: {"passwords": [str(p) for p in user.get("passwords") or [] if str(p) != password]})
 
 
 def software_update_pending():
@@ -341,20 +416,20 @@ def rar_multivolume(path):
     if sniff_archive(path) != "rar":
         return False
     try:
-        stat = path.stat()
+        signature = archive_part_signature(path)
         cfg = load_config()
         passwords = collect_hints(path.parent, cfg.get("passwords") or [], recursive=False)
         for ancestor in path.parent.parents:
             if ancestor != ROOT and ROOT not in ancestor.parents:
                 break
             passwords = collect_hints(ancestor, passwords, recursive=False)
-        return _rar_multivolume(str(path), stat.st_size, stat.st_mtime_ns, find_seven_zip(cfg), tuple(passwords))
+        return _rar_multivolume(str(path), signature[1], tuple(signature[2:]), find_seven_zip(cfg), tuple(passwords))
     except OSError:
         return False
 
 
 @lru_cache(maxsize=512)
-def _rar_multivolume(path, size, modified, seven, passwords=()):
+def _rar_multivolume(path, size, version, seven, passwords=()):
     if not seven:
         return False
     try:
@@ -376,14 +451,14 @@ def executable_archive(path):
     if sniff_archive(path):
         return True
     try:
-        stat = path.stat()
-        return _executable_archive(str(path), stat.st_size, stat.st_mtime_ns, find_seven_zip(load_config()))
+        signature = archive_part_signature(path)
+        return _executable_archive(str(path), signature[1], tuple(signature[2:]), find_seven_zip(load_config()))
     except OSError:
         return False
 
 
 @lru_cache(maxsize=512)
-def _executable_archive(path, size, modified, seven):
+def _executable_archive(path, size, version, seven):
     """先看 PE 末尾附加的数据，再让 7-Zip 确认；普通主程序的资源段不能当压缩包。"""
     if not seven:
         return False
@@ -473,14 +548,108 @@ def readable_group(group):
         combined.unlink(missing_ok=True)
 
 
+_SHARE_READ, _SHARE_WRITE, _SHARE_DELETE = 1, 2, 4
+_GENERIC_READ, _DELETE = 0x80000000, 0x10000
+_OPEN_EXISTING, _OPEN_REPARSE_POINT = 3, 0x00200000
+_BASIC_INFO, _DISPOSITION_INFO, _ID_INFO = 0, 4, 18
+_FILETIME_UNIX_EPOCH = 116_444_736_000_000_000
+_UNSUPPORTED_FILE_INFO = (1, 50, 87)
+
+
+class _FileInfo(ctypes.Structure):
+    _fields_ = [
+        ("attributes", wintypes.DWORD), ("created", wintypes.FILETIME), ("accessed", wintypes.FILETIME),
+        ("written", wintypes.FILETIME), ("volume", wintypes.DWORD), ("size_high", wintypes.DWORD),
+        ("size_low", wintypes.DWORD), ("links", wintypes.DWORD), ("id_high", wintypes.DWORD),
+        ("id_low", wintypes.DWORD),
+    ]
+
+
+class _BasicInfo(ctypes.Structure):
+    _fields_ = [
+        ("created", ctypes.c_int64), ("accessed", ctypes.c_int64), ("written", ctypes.c_int64),
+        ("changed", ctypes.c_int64), ("attributes", wintypes.DWORD),
+    ]
+
+
+class _IdInfo(ctypes.Structure):
+    _fields_ = [("volume", ctypes.c_uint64), ("file_id", ctypes.c_ubyte * 16)]
+
+
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_create_file = _kernel32.CreateFileW
+_create_file.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                         wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+_create_file.restype = wintypes.HANDLE
+_close_handle = _kernel32.CloseHandle
+_close_handle.argtypes = (wintypes.HANDLE,)
+_close_handle.restype = wintypes.BOOL
+_get_file_info = _kernel32.GetFileInformationByHandle
+_get_file_info.argtypes = (wintypes.HANDLE, ctypes.POINTER(_FileInfo))
+_get_file_info.restype = wintypes.BOOL
+_get_file_info_ex = _kernel32.GetFileInformationByHandleEx
+_set_file_info = _kernel32.SetFileInformationByHandle
+for _file_info_call in (_get_file_info_ex, _set_file_info):
+    _file_info_call.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD)
+    _file_info_call.restype = wintypes.BOOL
+
+
+@contextmanager
+def archive_handle(path, *, share=_SHARE_READ | _SHARE_WRITE | _SHARE_DELETE, delete=False):
+    # 删除时打开路径上的链接本身，避免跟随链接删掉目标文件。
+    access = _GENERIC_READ | (_DELETE if delete else 0)
+    flags = _OPEN_REPARSE_POINT if delete else 0
+    handle = _create_file(str(path), access, share, None, _OPEN_EXISTING, flags, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+    except OSError:
+        _close_handle(handle)
+        raise
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def optional_file_info(handle, kind, info):
+    if _get_file_info_ex(handle, kind, ctypes.byref(info), ctypes.sizeof(info)):
+        return True
+    code = ctypes.get_last_error()
+    if code not in _UNSUPPORTED_FILE_INFO:
+        raise ctypes.WinError(code)
+    return False
+
+
+def archive_part_signature(path, fd=None):
+    if fd is None:
+        with archive_handle(path) as opened:
+            return archive_part_signature(path, opened)
+    handle = msvcrt.get_osfhandle(fd)
+    info = _FileInfo()
+    if not _get_file_info(handle, ctypes.byref(info)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    size = (info.size_high << 32) | info.size_low
+    modified = (info.written.dwHighDateTime << 32) | info.written.dwLowDateTime
+    basic = _BasicInfo()
+    optional_file_info(handle, _BASIC_INFO, basic)
+    extended_id = _IdInfo()
+    if optional_file_info(handle, _ID_INFO, extended_id) and any(extended_id.file_id):
+        volume, file_id = extended_id.volume, bytes(extended_id.file_id).hex()
+    else:
+        volume, file_id = info.volume, (info.id_high << 32) | info.id_low
+    digest = None
+    if not basic.changed or not file_id:
+        # 文件系统没有提供完整的变化信息时，再读内容确认同名包是否换过。
+        with open(fd, "rb", closefd=False) as stream:
+            stream.seek(0)
+            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+    return [path.as_posix(), size, (modified - _FILETIME_UNIX_EPOCH) * 100, volume, file_id, basic.changed, digest]
+
+
 def group_signature(group):
-    sig = []
-    for p in group["parts"]:
-        try:
-            sig.append((p.as_posix(), p.stat().st_size))
-        except OSError:
-            sig.append((p.as_posix(), -1))
-    return tuple(sig)
+    return [archive_part_signature(part) for part in group["parts"]]
 
 
 def archive_complete(group):
@@ -506,15 +675,16 @@ def archive_complete(group):
         return False
 
 
-def group_ready(group, stable_seconds, seen):
+def group_ready(group, stable_seconds, seen, signature=None):
     key = group["key"]
-    try:
-        sig = group_signature(group)
-    except OSError:
-        return False
+    if signature is None:
+        try:
+            signature = group_signature(group)
+        except OSError:
+            return False
     record = seen.get(key)
-    if record is None or record[0] != sig:
-        seen[key] = (sig, time.time())
+    if record is None or record[0] != signature:
+        seen[key] = (signature, time.time())
         return False
     return time.time() - record[1] >= stable_seconds
 
@@ -593,7 +763,7 @@ def verify_password(seven, archive, password, probe_file, tmpdir):
         rc, _ = run_7z(seven, args)
     except subprocess.TimeoutExpired:
         return False
-    if rc not in (0, 1):
+    if rc != 0:
         return False
     return any(p.is_file() for p in Path(tmpdir).rglob("*"))
 
@@ -657,19 +827,23 @@ def _read_local_aes_header(fp, info):
     if len(header) < 30:
         raise ValueError("zip 头部不完整")
     fields = struct.unpack("<IHHHHHIIIHH", header)
-    csize, nlen, elen = fields[7], fields[9], fields[10]
+    if fields[0] != 0x04034b50:
+        raise ValueError("zip 头部不正确")
+    nlen, elen = fields[9], fields[10]
     fp.read(nlen)
     extra = fp.read(elen)
     aes = None
     while len(extra) >= 4:
         hid, hsize = struct.unpack("<HH", extra[:4])
         body = extra[4:4 + hsize]
-        if hid == 0x9901 and len(body) >= 7:
-            aes = {"strength": body[4], "actual": struct.unpack("<H", body[5:7])[0]}
+        if hid == 0x9901 and len(body) >= 7 and body[2:4] == b"AE":
+            aes = {"version": struct.unpack("<H", body[:2])[0],
+                   "strength": body[4], "actual": struct.unpack("<H", body[5:7])[0]}
         extra = extra[4 + hsize:]
-    if not aes or aes["strength"] not in ZIP_AES_STRENGTH:
+    if not aes or aes["version"] not in (1, 2) or aes["strength"] not in ZIP_AES_STRENGTH:
         raise ValueError("不是 AES 加密的 zip 条目")
-    return aes, csize, fp.tell()
+    # 带数据描述符或 ZIP64 的文件，本地头部可能不存实际长度。
+    return aes, info.compress_size, fp.tell()
 
 
 def _derive_zip_keys(password, salt, key_len):
@@ -734,11 +908,15 @@ def _decrypt_aes_entry(zip_path, info, pwd_bytes, target):
 
     with open(zip_path, "rb") as fp:
         aes, csize, data_off = _read_local_aes_header(fp, info)
+        if aes["actual"] not in (0, 8):
+            raise ValueError("暂不支持这种 zip 压缩方式")
         salt_len = {1: 8, 2: 12, 3: 16}[aes["strength"]]
         key_len = ZIP_AES_STRENGTH[aes["strength"]]
         fp.seek(data_off)
         salt = fp.read(salt_len)
         verifier = fp.read(2)
+        if len(salt) != salt_len or len(verifier) != 2:
+            raise ValueError("zip 数据被截断")
         enc_key, auth_key, check = _derive_zip_keys(pwd_bytes, salt, key_len)
         if check != verifier:
             raise ValueError("密码不对")
@@ -750,11 +928,12 @@ def _decrypt_aes_entry(zip_path, info, pwd_bytes, target):
         inflater = zlib.decompressobj(-15) if aes["actual"] == 8 else None
         counter = 1
         remaining = cipher_len
+        written, crc = 0, 0
         with open(target, "wb") as out:
             while remaining > 0:
                 want = min(16 * 1024 * 1024, remaining)
                 chunk = fp.read(want)
-                if not chunk:
+                if len(chunk) != want:
                     raise ValueError("zip 数据被截断")
                 blocks = (len(chunk) + 15) // 16
                 counters = b"".join((counter + i).to_bytes(16, "little") for i in range(blocks))
@@ -767,13 +946,21 @@ def _decrypt_aes_entry(zip_path, info, pwd_bytes, target):
                     plain = inflater.decompress(plain)
                 if plain:
                     out.write(plain)
+                    written += len(plain)
+                    crc = zlib.crc32(plain, crc)
             if inflater is not None:
                 tail = inflater.flush()
                 if tail:
                     out.write(tail)
+                    written += len(tail)
+                    crc = zlib.crc32(tail, crc)
+                if not inflater.eof or inflater.unused_data or inflater.unconsumed_tail:
+                    raise ValueError("zip 压缩数据不完整")
             stored_mac = fp.read(10)
-    if stored_mac and digest.digest()[:10] != stored_mac:
-        log(f"  警告：{info.filename} 校验值不一致，文件可能不完整")
+    if len(stored_mac) != 10 or not hmac.compare_digest(digest.digest()[:10], stored_mac):
+        raise ValueError("zip 完整性校验失败，文件可能已损坏")
+    if written != info.file_size or (aes["version"] == 1 and crc != info.CRC):
+        raise ValueError("zip 文件大小或校验值不正确")
 
 
 def extract_zip_with_python(zip_path, pwd_bytes, staging):
@@ -873,7 +1060,7 @@ def extract_to_staging(seven, group, candidates, staging):
         if note == "密码正确":
             log("  密码已匹配")
         rc, output = extract_archive(seven, group, pwd, staging)
-        if rc in (0, 1):
+        if rc == 0:
             return True, note
         tail = "\n".join(output.strip().splitlines()[-3:])
         return False, f"解压失败（退出码 {rc}）：{tail}"
@@ -981,6 +1168,41 @@ def delete_group_files(group):
         except OSError:
             pass
     return removed
+
+
+def mark_archive_for_deletion(fd, delete):
+    disposition = wintypes.BOOLEAN(delete)
+    if not _set_file_info(msvcrt.get_osfhandle(fd), _DISPOSITION_INFO,
+                          ctypes.byref(disposition), ctypes.sizeof(disposition)):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def delete_source_group(group):
+    """只有所有分卷都还是刚处理过的文件，才通过已核对的句柄删除。"""
+    try:
+        with ExitStack() as stack:
+            sources = [(part, stack.enter_context(archive_handle(part, share=_SHARE_READ, delete=True)))
+                       for part in group["parts"]]
+            if [archive_part_signature(part, fd) for part, fd in sources] != group["processed_signature"]:
+                log(f"  原压缩包已变化，保留当前文件：{group['trigger'].name}")
+                return 0
+            marked = []
+            try:
+                for part, fd in sources:
+                    mark_archive_for_deletion(fd, True)
+                    marked.append((part, fd))
+            except OSError:
+                # 文件要等句柄关闭才删除，标记失败时先撤回已标记的分卷。
+                for part, fd in reversed(marked):
+                    try:
+                        mark_archive_for_deletion(fd, False)
+                    except OSError as error:
+                        log(f"  无法撤回清理：{part.name}：{error}")
+                raise
+    except OSError as error:
+        log(f"  原压缩包未能清理：{group['trigger'].name}：{error}")
+        return 0
+    return len(sources)
 
 
 # ---------------------------------------------------------------- 嵌套压缩包
@@ -1129,7 +1351,9 @@ def divert_android_archive(group, cfg, watch_roots):
     if mode not in ("archive", "delete"):
         return False
     if mode == "delete":
-        removed = delete_group_files(group)
+        removed = delete_source_group(group)
+        if not removed:
+            return False
         log(f"  这是安卓版，按设置删掉了（{removed} 个文件）")
     else:
         for part in group["parts"]:
@@ -1185,7 +1409,7 @@ def remove_empty_dirs(directory):
 
 
 # ---------------------------------------------------------------- 主流程
-def process_group(seven, group, cfg, passwords, watch_roots, into=None, progress=None):
+def process_group(seven, group, cfg, passwords, watch_roots, into=None, progress=None, expected_signature=None):
     """解压一组压缩包并整理好，返回 (成功没有, 说明)。
 
     into：解压进这个文件夹（游戏库手动导入用）。这时只装着安卓版的压缩包解到安卓文件夹，
@@ -1205,11 +1429,23 @@ def process_group(seven, group, cfg, passwords, watch_roots, into=None, progress
         hints = collect_hints(ancestor, hints, recursive=False)
     staging = WORK_DIR / f"_staging_{uuid4().hex}"
     try:
-        with readable_group(group) as readable:
-            android_only = archive_is_android(seven, readable, hints)
-            if android_only and into is None and divert_android_archive(group, cfg, watch_roots):
+        with ExitStack() as stack:
+            # 读取期间阻止原文件被写入。分卷临时硬链接清理后，再从同一批句柄取变化信息。
+            sources = [(part, stack.enter_context(archive_handle(part, share=_SHARE_READ | _SHARE_DELETE)))
+                       for part in group["parts"]]
+            if expected_signature is not None and [archive_part_signature(part, fd) for part, fd in sources] != expected_signature:
+                return False, "压缩包在解压前已变化，稍后再试"
+            with readable_group(group) as readable:
+                android_only = archive_is_android(seven, readable, hints)
+                divert = android_only and into is None and cfg.get("android") in ("archive", "delete")
+                if not divert:
+                    ok, note = extract_to_staging(seven, readable, hints, staging)
+            if divert or ok:
+                group["processed_signature"] = [archive_part_signature(part, fd) for part, fd in sources]
+        if divert:
+            if divert_android_archive(group, cfg, watch_roots):
                 return True, "安卓版"
-            ok, note = extract_to_staging(seven, readable, hints, staging)
+            return False, "安卓版原包已变化或无法清理"
         if not ok:
             log(f"  跳过：{note} —— {trigger.name}")
             return False, note
@@ -1239,8 +1475,9 @@ def process_group(seven, group, cfg, passwords, watch_roots, into=None, progress
             dest = android_root(cfg)
         log(f"  已解压到：{dest}")
         if into is None and cfg.get("delete_archive", True):
-            removed = delete_group_files(group)
-            log(f"  已删除压缩包 {removed} 个")
+            removed = delete_source_group(group)
+            if removed:
+                log(f"  已删除压缩包 {removed} 个")
         return True, note
     finally:
         shutil.rmtree(staging, ignore_errors=True)
@@ -1297,8 +1534,6 @@ def _scan_once(cfg, seven, state, seen, cooldown, force=False, progress=None):
 
     def nested_progress(event):
         if event["phase"] == "result":
-            if event["ok"]:
-                state[event["path"]] = True
             result(Path(event["file"]), event["ok"], event["message"])
         elif progress:
             progress(event)
@@ -1338,35 +1573,48 @@ def _scan_once(cfg, seven, state, seen, cooldown, force=False, progress=None):
                 group = archive_group(path)
                 if not group:
                     continue
-                if str(path) in state:
+                try:
+                    signature = group_signature(group)
+                except OSError:
+                    report["waiting"] += 1
+                    continue
+                saved = state.get(str(path))
+                if saved is True or saved == [part[:3] for part in signature]:
+                    # 补齐旧记录中的文件标识，避免把保留的旧包全部再解一遍。
+                    state[str(path)] = signature
+                if state.get(str(path)) == signature:
                     continue
                 if not archive_complete(group):
                     report["waiting"] += 1
                     continue
                 if time.time() - cooldown.get(group["key"], 0) < 120:
                     continue
-                if not force and not group_ready(group, stable, seen):
+                if not force and not group_ready(group, stable, seen, signature):
                     report["waiting"] += 1
                     continue
+                state.pop(str(path), None)
                 found += 1
                 if progress:
                     progress({"phase": "extracting", "file": path.name, "message": "正在解压"})
                 try:
                     ok, note = process_group(seven, group, cfg, cfg.get("passwords") or [], watch_roots,
-                                             progress=nested_progress)
+                                             progress=nested_progress, expected_signature=signature)
                 except Exception as e:  # noqa: BLE001 单个文件出错不影响其它
                     log(f"  处理异常：{path.name}：{e}")
                     ok, note = False, str(e)
                 result(path, ok, "已解压" if ok else note)
                 if ok:
-                    state[str(path)] = True
+                    state[str(path)] = group["processed_signature"]
                 else:
                     cooldown[group["key"]] = time.time()
     if found == 0:
         log("扫描完成，没有发现可解压的压缩包")
     else:
         log(f"扫描完成，处理了 {found} 个压缩包")
-    save_state({k: v for k, v in state.items() if Path(k).exists()})
+    for key in list(state):
+        if not Path(key).exists():
+            del state[key]
+    save_state(state)
     return report
 
 
@@ -1392,7 +1640,8 @@ def scan_for_library(seven):
 
 def load_state():
     try:
-        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        return state if isinstance(state, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {}
 

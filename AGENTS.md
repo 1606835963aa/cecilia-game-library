@@ -25,7 +25,7 @@
 | 文件 | 内容 |
 | --- | --- |
 | `auto_extract.py` | 解压引擎和基础工具：`load_config` / `save_config`、`DEFAULT_CONFIG`、`ROOT`、分卷识别（`archive_group`）、试密码（`choose_password`，一次把所有候选都试完）、GBK 密码 zip 自解密、套娃解压、安卓版分流、`scan_once` / `watch_loop` |
-| `library.py` | SQLite 数据库（`data/library.db`，表 `games` 和 `sessions`）、引擎识别、主程序挑选、扫描入库、图标提取、低完整性标签修复、回收站删除 |
+| `library.py` | SQLite 数据库（`data/library.db`，表 `games`、`sessions` 和 `game_groups`）、引擎识别、主程序挑选、扫描入库、图标提取、低完整性标签修复、回收站删除 |
 | `scraper.py` | 找资料：游戏文件本地读取（Ren'Py rpa、Godot pck、RPG Maker、Unity）+ Steam / VNDB / DLsite / itch.io / SubscribeStar 公开主页；`Worker` 是后台排队线程 |
 | `itch_account.py` | itch.io 官网登录窗口、登录和成人内容状态检测、同一浏览器会话中的搜索、退出清理；登录状态由 WebView2 保存在 `data/webview` |
 | `wishlist.py` | 无本地文件的愿望单、加入时版本和官网版本历史、与已下载游戏的关联 |
@@ -35,8 +35,9 @@
 | `app_version.py` | 软件发布版本，更新检查和打包共用 |
 | `updates.py` | GitHub 正式版检查、下载校验、空闲更新调度；源码只检查，不覆盖源码 |
 | `update_helper.py` | 独立更新助手、更新包清单校验、程序替换、启动确认和失败还原 |
+| `cecold.py` | 独立冷藏包的打包、解冻和校验：文件与数据块去重、零块省略、原始 LZMA2 数据块、可逆 PNG / JPEG 重压缩；PNG 批量编码并逐文件验证，解冻检查原大小和 SHA-256；不调用 7-Zip，不删除来源文件 |
 | `web/index.html` | 页面骨架，含占位符 `__TOKEN__` `__THEME__` `__FRAME__` `__VERSION__`，由 `game_manager.index()` 替换 |
-| `web/app.js` | 全部前端逻辑，原生 JS，无框架、无打包。路由用 hash：`#/`、`#/game/<id>`、`#/settings` |
+| `web/app.js` | 全部前端逻辑，原生 JS，无框架、无打包。路由用 hash：`#/`、`#/game/<id>`、`#/group/<id>`、`#/wishlist`、`#/settings` |
 | `web/style.css` | 默认皮肤「经典深色」（`steam`），颜色都是 `:root` 上的 CSS 变量 |
 | `web/theme-paper.css` | 皮肤「浪子的真情」（`paper`），全部写在 `[data-theme="paper"]` 下，覆盖变量和少量组件样式 |
 | `web/icon.ico` | 软件图标：窗口、任务栏、favicon、经典深色皮肤左上角 |
@@ -80,6 +81,7 @@ python packaging/build.py
 - **绿色版**：把 `dist/塞西莉亚的游戏库` 复制到 `tmp/` 下，放好 `config.json` 和测试压缩包再运行两个 exe，数据都写在复制出来的文件夹里。
 - **隔离**：`ROOT` 取的是脚本所在文件夹，把项目复制到 `tmp/` 下的沙盒里跑，就有独立的 `config.json`、`games/`、`data/`，不会碰用户的真实数据和密码。
 - 临时文件放项目里的 `tmp/`（已在 `.gitignore`），用完删掉。
+- **冷藏包**：`python cecold.py pack <游戏目录> <包路径>` / `unpack <包路径> <新目录>` / `verify <包路径>`。`python packaging/fetch_cold_codecs.py` 按固定 SHA-256 下载图片工具到 `codecs/`；7-Zip 仅用于解包下载的 JPEG 工具，不参与冷藏包编解码。命令行自动寻找 `codecs/packPNG.exe`，也可用 `--png-tool` 指定，`--no-png` 关闭打包时的 PNG 优化；`--jxl-bin codecs` 启用 JPEG 优化。`--image-threads` 控制图片并行数，`--effort balanced` 为默认档，`compact` 优先体积，`fast` 优先速度。含 PNG 转换的包使用版本 2，读取器兼容版本 1；图片压后变大或试还原失败时保留原字节。`--temp-dir` 必须位于项目 `tmp` 内，输出路径必须不存在并与临时目录同盘。游戏库页面和自动解压不会自动处理 `.cecold`。
 
 ## 改代码时要注意
 
@@ -90,10 +92,12 @@ python packaging/build.py
 - **打包成 exe**：`auto_extract.ROOT` 是可写的数据位置（源码运行时是项目文件夹，打包后是 exe 所在文件夹），`APP_DIR` 是程序自带文件的位置（打包后是 `_internal`）。设置、数据、游戏用 `ROOT`，页面这类随程序发布的文件用 `APP_DIR`。打包后「刷新」调用旁边的 `自动解压.exe`，源码运行时调用 `python.exe auto_extract.py`。新加的随程序发布的文件要写进 `cecilia.spec` 的 `datas`；按名字动态加载的模块要写进 `hiddenimports`。
 - **软件更新**：`app_version.VERSION` 和 GitHub 正式发布标签须一致。构建输出 zip、SHA-256 文件和包内 `update-manifest.json`，发布时上传 zip 和校验文件。更新只接受本仓库正式版且带 GitHub SHA-256 的 zip；助手是独立 exe，不依赖待替换的 `_internal`。只替换 `update_helper.OWNED` 列出的程序项，用户数据不在更新清单里。主程序阻止新写入并等待已有任务；自动解压在两轮之间响应更新标记并退出，助手完成后重开它。新版确认窗口能打开前不启动后台写入，失败则还原程序和升级前的数据库。更新任务放 `tmp/updates`，助手退出后清理，无法还原的备份保留。
 - **拖放导入**：完整文件路径只有 Python 这边拿得到（`Shell.on_drop` 里的 `pywebviewFullPath`），再通过 `window.importDropped(...)` 交给页面。
-- **改设置**：`save_config(updates)` 只合并给出的键。密码列表的增删接口（`/api/passwords`、`/api/passwords/remove`）每次在当下的文件上加减一个，不整份覆盖，因为导入线程也会往里写密码。
+- **改设置**：`save_config(updates)` 用线程锁和 `data/config.lock` 文件锁保护读取、合并和保存，先写项目 `tmp` 下的临时文件，再原子替换设置文件。普通设置只合并给出的键；需要读当前值再修改时传入函数。密码增删统一用 `add_password` / `remove_password`，在锁内读取最新列表，不能先读取再整份覆盖，因为导入线程也会往里写密码。
+- **解压成功判定**：7-Zip 必须正常完成；中文密码 ZIP 的 AES 校验码、解压大小、压缩流结尾和 AE-1 的 CRC 都必须通过。失败不发布游戏、不删除来源原包。解压记录保存每个分卷的路径、大小、修改时间、文件标识和系统变化时间，旧记录首次扫描时补齐。自动清理先核对整组分卷，再按已经核对的文件句柄删除。
 - **目录分工**：`download_dirs` 是待解压来源，`games_dir` 是 PC 成品目录，`watch_dirs` 是额外的游戏扫描目录。下载目录不能与 PC、安卓成品目录重叠。完整解压和套娃检查在中转目录完成，内层失败保留来源原包。`publish_game` 去掉单一包装层并原子放进 `Game_编号`，`.game-library.json` 保存原名供入库和资料匹配。
 - **两边同时解压**：导入用 `data/import` 当中转文件夹（`importer.py` 里改了 `auto_extract.WORK_DIR`），自动解压用 `data/`；导入时在 `games` 里用的中转文件夹叫 `_正在导入`，它在 `SKIP_DIRS` 里，游戏库扫描和自动解压都跳过；自动解压还会跳过所有以 `_` 开头的文件夹。
 - **数据库迁移**：新字段加进 `library.EXTRA_COLUMNS`，`init_db` 启动时会给老数据库自动补列。路径在库里存相对 `ROOT` 的形式（`to_rel` / `to_abs`）。
+- **自定义分组**：每条本地游戏可选一个 `group_id`，和游玩状态独立。删除分组会在同一事务内把游戏移回默认分组。隐藏分组只存带随机盐的密码校验值，解锁权限放在主进程内存中。接口按当前会话过滤分组、游戏、图片和任务记录。
 - **愿望单**：`games.is_wishlist=1` 的记录不需要物理路径，扫描、未处理队列和文件操作必须跳过。`wish_version` 只在加入或用户手动填写时改，之后获取官网资料只更新最近版本和历史；官网没标注或联网失败保留旧记录。关联本地游戏保留愿望单编号、版本和备注，合并记录，不移动游戏文件。
 - **手动改过的不覆盖**：`exe_locked=1` 的主程序扫描不改；文件名带 `-custom` 的封面、背景是手动换的，找资料时不覆盖。
 - **皮肤**：新组件先在 `style.css` 用变量写，浪子的真情皮肤需要不同样子时在 `theme-paper.css` 的 `[data-theme="paper"]` 下覆盖。加皮肤还要在 `game_manager.THEMES` 里配标题栏和底色。
